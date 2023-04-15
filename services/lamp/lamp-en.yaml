@@ -1,0 +1,240 @@
+heat_template_version: rocky
+description: LAMP
+parameter_groups:
+- label: General
+  dscription: General parameters
+  parameters:
+  - key
+  - flavor
+  - volume_size
+  - local_net
+  - public_access
+  - admin_ranges
+  - availability_zone
+  - backup
+  - backup_days
+parameters:
+  flavor:
+    type: string
+    description: Flavor to be used
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  public_access:
+    label: Public Access
+    type: boolean
+    default: false
+    description: This option will give the instance public IP access
+  key:
+    type: string
+    description: Key pair name (the name can be found under Key Pairs / SSH-nycklar)
+    constraints:
+    - custom_constraint: nova.keypair
+  local_net:
+    type: string
+    description: The local network you want the server to be attached on (a floating
+      IP will automatically be associated with this interface)
+    constraints:
+    - custom_constraint: neutron.network
+  availability_zone:
+    label: Availability zone
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b
+    type: string
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Backup of lamp volume
+  backup_days:
+    label: Backup days
+    type: number
+    default: 10
+    description: Days backup will be saved before deleted
+  admin_ranges:
+    type: string
+    label: SSH Admin IP
+    description: IP for public SSH access
+    default: 127.0.0.1/32
+  volume_size:
+    description: Size of volume
+    default: 20
+    type: string
+conditions:
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+  public_res:
+    not:
+      equals:
+      - get_param: public_access
+      - false
+resources:
+  cloudconfig:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_upgrade: true
+        packages:
+        - apache2
+        - mariadb-server
+        - php-mysql
+        - libapache2-mod-php
+        package_update: true
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        password:
+          get_resource: ubuntu_password
+  port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+      - get_resource: sec_ssh
+      - get_resource: sec_web
+  lamp_float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: public_res
+    properties:
+      floating_network:
+        list_join:
+        - '-'
+        - - str_replace:
+              template:
+                get_param: availability_zone
+              params:
+                se-1: se-1-1
+          - net0
+  lamp_float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: public_res
+    properties:
+      floatingip_id:
+        get_resource: lamp_float_ip
+      port_id:
+        get_resource: port
+  webserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - lamp
+      flavor:
+        get_param: flavor
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: root_volume
+      networks:
+      - port:
+          get_resource: port
+      key_name:
+        get_param: key
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: cloudconfig
+  root_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - lamp
+      size:
+        get_param: volume_size
+      volume_type: ssd
+      image: ubuntu-jammy-22-x86_64
+  ubuntu_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 7
+      salt:
+        get_param: OS::stack_name
+  sec_web:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - web
+      rules:
+      - protocol: tcp
+        port_range_min: 80
+        port_range_max: 80
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 443
+        port_range_max: 443
+        remote_ip_prefix: 0.0.0.0/0
+  sec_ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ssh
+      rules:
+      - protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix:
+          get_param: admin_ranges
+  cron_name:
+    type: OS::Heat::RandomString
+    condition: backup_res
+    properties:
+      salt:
+        get_param: OS::stack_name
+  volume_backup1:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: lamp-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+outputs:
+  ubuntu_password:
+    description: Password for Ubuntu user
+    value:
+      get_resource: ubuntu_password
+  Web_public:
+    condition: public_res
+    description: Web Public IP
+    value:
+      str_replace:
+        template: http://host
+        params:
+          host:
+            get_attr:
+            - lamp_float_ip
+            - floating_ip_address

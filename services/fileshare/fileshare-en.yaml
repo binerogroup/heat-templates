@@ -1,0 +1,337 @@
+heat_template_version: rocky
+description: Share
+parameter_groups:
+- label: General
+  dscription: General parameters
+  parameters:
+  - key
+  - flavor
+  - samba
+  - nfs
+  - disk_type
+  - volume_size
+  - local_net
+  - availability_zone
+  - backup
+  - backup_days
+parameters:
+  key:
+    type: string
+    description: Key pair name (If you see nothing you need to first create a key
+      under SSH-KEY)
+    constraints:
+    - custom_constraint: nova.keypair
+  local_net:
+    label: Local network
+    type: string
+    description: The local network you want the server to be attached on (If you see
+      nothing you need to first create a local netowrok)
+    default: local
+    constraints:
+    - custom_constraint: neutron.network
+  flavor:
+    label: Instance Flavor
+    type: string
+    description: Flavor to be used for the instance
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  availability_zone:
+    label: Availability zone
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b
+    type: string
+  volume_size:
+    description: shared space size in GB
+    default: 100
+    type: string
+  samba:
+    label: Windows Samba
+    type: boolean
+    default: false
+    description: Shared space will accasible thru the samba protocl
+  nfs:
+    label: Linux NFS
+    type: boolean
+    default: false
+    description: Shared space will accasible thru the nfs protocl
+  disk_type:
+    label: Disk type ssd or hdd
+    type: string
+    default: ssd
+    description: null
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Backup of all volumes
+  backup_days:
+    label: Backup days
+    type: number
+    default: 10
+    description: Days backup will be saved before deleted
+conditions:
+  nfs_res:
+    not:
+      equals:
+      - get_param: nfs
+      - false
+  samba_res:
+    not:
+      equals:
+      - get_param: samba
+      - false
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+resources:
+  shareconfig:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        password:
+          get_resource: ubuntu_password
+        fs_setup:
+        - label: share
+          filesystem: ext4
+          partition: none
+          device: /dev/sdb
+        mounts:
+        - - LABEL=share
+          - /share
+        runcmd:
+        - mkdir /share
+        - mkdir /share/smb
+        - mkdir /share/nfs
+        - chmod -R 0755 /share
+        - str_replace:
+            template: "if [ \"!NFS!\" = \"True\" ]; then\n  DEBIAN_FRONTEND=noninteractive
+              apt -o Dpkg::Options::=\"--force-confdef\" -o Dpkg::Options::=\"--force-confold\"
+              install nfs-kernel-server -y\nfi\nif [ \"!SAMBA!\" = \"True\" ]; then\n
+              \ DEBIAN_FRONTEND=noninteractive apt -o Dpkg::Options::=\"--force-confdef\"
+              -o Dpkg::Options::=\"--force-confold\" install samba -y\nfi\nif [ \"!NFS!\"
+              = \"True\" ]; then\n  echo \"/share/nfs *(rw,no_subtree_check,no_root_squash,sync)\"
+              > /etc/exports\nfi\nif [ \"!SAMBA!\" = \"True\" ]; then\n  echo [sambashare]
+              >> /etc/samba/smb.conf\n  echo comment = Samba >> /etc/samba/smb.conf\n
+              \ echo path = /share/smb >> /etc/samba/smb.conf\n  echo read only =
+              no >> /etc/samba/smb.conf\n  echo guest ok = yes >> /etc/samba/smb.conf\n
+              \ echo browsable = yes >> /etc/samba/smb.conf\n  echo create mask =
+              0755 >> /etc/samba/smb.conf\n  echo directory mask = 0755 >> /etc/samba/smb.conf\n
+              \ chown nobody:nogroup /share/smb\nfi\n"
+            params:
+              '!SAMBA!':
+                get_param: samba
+              '!NFS!':
+                get_param: nfs
+        - reboot
+  shareserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - share
+      flavor:
+        get_param: flavor
+      networks:
+      - network:
+          get_param: local_net
+      security_groups:
+      - get_resource: sec_ssh
+      - get_resource: sec_nfs
+      - get_resource: sec_samba
+      key_name:
+        get_param: key
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: root_volume
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: shareconfig
+  sec_samba:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - samba
+      rules:
+      - protocol: tcp
+        port_range_min: 139
+        port_range_max: 139
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 445
+        port_range_max: 445
+        remote_ip_prefix: 0.0.0.0/0
+  sec_ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ssh
+      rules:
+      - protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+  sec_nfs:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - nfs
+      rules:
+      - protocol: tcp
+        port_range_min: 2049
+        port_range_max: 2049
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 111
+        port_range_max: 111
+        remote_ip_prefix: 0.0.0.0/0
+  my_volume_attachment:
+    depends_on:
+    - sharedvolume
+    type: OS::Cinder::VolumeAttachment
+    properties:
+      instance_uuid:
+        get_resource: shareserver
+      volume_id:
+        get_resource: sharedvolume
+  sharedvolume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - share
+      size:
+        get_param: volume_size
+      volume_type:
+        get_param: disk_type
+  root_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - share
+      size: 20
+      volume_type:
+        get_param: disk_type
+      image: ubuntu-jammy-22-x86_64
+  ubuntu_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 7
+      salt:
+        get_param: OS::stack_name
+  cron_name:
+    type: OS::Heat::RandomString
+    condition: backup_res
+    properties:
+      salt:
+        get_param: OS::stack_name
+  volume_backup1:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: Fileshare-share-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: sharedvolume
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+  volume_backup2:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: Fileshare-root-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+outputs:
+  nfs:
+    value:
+      str_replace:
+        template: 'This will mount the nfs share
+
+          mount -t nfs !host!:/share/nfs [Local_mountpoint]
+
+
+          Add belove to /etc/fstab to make the system mount nfs share on boot
+
+          !host!:/share/nfs [Local_mountpoint] nfs users,auto,rw  0  0
+
+          '
+        params:
+          '!host!':
+            get_attr:
+            - shareserver
+            - first_address
+    description: Replace [Local_mountpoint] with the location you want the share to
+      be mounted on example /mnt
+  samba:
+    value:
+      str_replace:
+        template: 'net use Z: \\!host!\sambashare /PERSISTENT:YES
+
+          '
+        params:
+          '!host!':
+            get_attr:
+            - shareserver
+            - first_address
+    description: Go to "run" and ok the above to mount the samba share on windows
+  ubuntu_password:
+    description: Password for Ubuntu user
+    value:
+      get_resource: ubuntu_password

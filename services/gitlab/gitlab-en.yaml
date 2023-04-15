@@ -1,0 +1,258 @@
+heat_template_version: rocky
+description: gitlab
+parameter_groups:
+- label: General
+  dscription: General parameters
+  parameters:
+  - key
+  - flavor
+  - local_net
+  - public_access
+  - availability_zone
+  - backup
+  - backup_days
+parameters:
+  key:
+    type: string
+    description: Key pair name (If you see nothing you need to first create a key
+      under SSH-KEY)
+    constraints:
+    - custom_constraint: nova.keypair
+  local_net:
+    label: Local network
+    type: string
+    description: The local network you want the server to be attached on (If you see
+      nothing you need to first create a local netowrok)
+    default: local
+    constraints:
+    - custom_constraint: neutron.network
+  flavor:
+    label: Instance Flavor
+    type: string
+    description: Flavor to be used for the instance
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  availability_zone:
+    label: Availability zone
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b
+    type: string
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Backup of all volumes
+  backup_days:
+    label: Backup days
+    type: number
+    default: 10
+    description: Days backup will be saved before deleted
+  public_access:
+    label: Public Access
+    type: boolean
+    default: false
+    description: This option will give the instance public IP access
+conditions:
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+  public_res:
+    not:
+      equals:
+      - get_param: public_access
+      - false
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+      - get_resource: ssh_gitlab
+      - get_resource: http-https_gitlab
+  gitlab_float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: public_res
+    properties:
+      floating_network:
+        list_join:
+        - '-'
+        - - str_replace:
+              template:
+                get_param: availability_zone
+              params:
+                se-1: se-1-1
+          - net0
+  gitlab_float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: public_res
+    properties:
+      floatingip_id:
+        get_resource: gitlab_float_ip
+      port_id:
+        get_resource: port
+  gitlabconfig:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        packages:
+        - ca-certificates
+        - curl
+        - tzdata
+        - openssh-server
+        - mailutils
+        - debian-archive-keyring
+        - lsb-release
+        - apt-transport-https
+        - software-properties-common
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        password:
+          get_resource: ubuntu_password
+        runcmd:
+        - sed -i 's/inet_interfaces = all/inet_interfaces = loopback-only/g' /etc/postfix/main.cf
+        - systemctl restart postfix
+        - gpg_key_url="https://packages.gitlab.com/gitlab/gitlab-ce/gpgkey"
+        - curl -fsSL $gpg_key_url| sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/gitlab.gpg
+        - echo deb https://packages.gitlab.com/gitlab/gitlab-ce/ubuntu/ focal main
+          >> /etc/apt/sources.list.d/gitlab_gitlab-ce.list
+        - echo deb-src https://packages.gitlab.com/gitlab/gitlab-ce/ubuntu/ focal
+          main >> /etc/apt/sources.list.d/gitlab_gitlab-ce.list
+        - apt update
+        - curl -sS https://packages.gitlab.com/install/repositories/gitlab/gitlab-ce/script.deb.sh
+          | bash
+        - apt update
+        - apt install gitlab-ce -y
+        - str_replace:
+            template: 'sed -i"" "s#\# gitlab_rails\[''initial_root_password.*#gitlab_rails\[''initial_root_password''\]
+              = \""!GITROOTPASS!"\"#g" /etc/gitlab/gitlab.rb
+
+              '
+            params:
+              '!GITROOTPASS!':
+                get_resource: gitlab_password
+        - gitlab-ctl reconfigure
+  gitlabserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - gitlab
+      flavor:
+        get_param: flavor
+      networks:
+      - port:
+          get_resource: port
+      key_name:
+        get_param: key
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: root_volume
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: gitlabconfig
+  http-https_gitlab:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - web
+      rules:
+      - protocol: tcp
+        port_range_min: 80
+        port_range_max: 80
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 443
+        port_range_max: 443
+        remote_ip_prefix: 0.0.0.0/0
+  ssh_gitlab:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ssh
+      rules:
+      - protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+  root_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - share
+      size: 20
+      volume_type: ssd
+      image: ubuntu-jammy-22-x86_64
+  ubuntu_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 7
+      salt:
+        get_param: OS::stack_name
+  gitlab_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 8
+      salt:
+        get_param: OS::stack_name
+  cron_name:
+    type: OS::Heat::RandomString
+    condition: backup_res
+    properties:
+      salt:
+        get_param: OS::stack_name
+  volume_backup:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: gitlab-root-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+outputs:
+  ubuntu_password:
+    description: Password for Ubuntu user
+    value:
+      get_resource: ubuntu_password
+  gitlab_root_password:
+    description: Password for gitlab webgui root user
+    value:
+      get_resource: gitlab_password

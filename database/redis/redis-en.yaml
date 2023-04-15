@@ -1,0 +1,172 @@
+description: Heat template to download redis server in ubuntu 20.
+heat_template_version: '2018-08-31'
+outputs:
+  ubuntu_password:
+    description: Password for Ubuntu user
+    value:
+      get_resource: ubuntu_password
+  redis_password:
+    description: Password for Authentication to Redis
+    value:
+      get_resource: redis_password
+  redis_port:
+    description: Port on which Redis is running
+    value: 6379
+parameters:
+  availability_zone:
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b
+    type: string
+  flavor:
+    constraints:
+    - custom_constraint: nova.flavor
+    description: Flavor of the instance to be created.
+    type: string
+  private_net_name:
+    constraints:
+    - custom_constraint: neutron.network
+    description: Private network to use for instance to be created.
+    type: string
+  private_subnet_name:
+    description: Private subnetwork to use for instance to be created.
+    type: string
+    constraints:
+    - custom_constraint: neutron.subnet
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Backup of redis volume
+  backup_days:
+    label: Backup days
+    type: number
+    default: 10
+    description: Days backup will be saved before deleted
+conditions:
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+resources:
+  cloudconfig:
+    properties:
+      cloud_config:
+        chpasswd:
+          expire: false
+        package_reboot_if_required: true
+        package_upgrade: true
+        packages:
+        - redis
+        ssh_pwauth: true
+        password:
+          get_resource: ubuntu_password
+        runcmd:
+        - str_replace:
+            template: sed -i 's/# requirepass foobared/requirepass $redis_password/g'
+              /etc/redis/redis.conf
+            params:
+              $redis_password:
+                get_resource: redis_password
+        - tot_mem=$(grep MemTotal /proc/meminfo | awk '{print $2 * 1024 * .9}')
+        - sed -i "s/# maxmemory <bytes>/maxmemory $tot_mem/g" "/etc/redis/redis.conf"
+        - sed -i 's/# maxmemory-policy noeviction/maxmemory-policy volatile-lfu/g'
+          /etc/redis/redis.conf
+        - sed -i 's/bind 127.0.0.1/bind 0.0.0.0/g' "/etc/redis/redis.conf"
+        - sudo systemctl restart redis
+        - list_join:
+          - ' '
+          - - get_attr:
+              - wait_handle
+              - curl_cli
+            - --data-binary
+            - '''{"status": "SUCCESS"}'''
+    type: OS::Heat::CloudConfig
+  redis:
+    properties:
+      admin_user: ubuntu
+      config_drive: true
+      flavor:
+        get_param: flavor
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: root_volume
+      networks:
+      - port:
+          get_resource: server_port
+      user_data:
+        get_resource: cloudconfig
+      user_data_format: SOFTWARE_CONFIG
+    type: OS::Nova::Server
+  redis_password:
+    type: OS::Heat::RandomString
+    properties:
+      salt:
+        get_param: OS::stack_name
+  ubuntu_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 7
+      salt:
+        get_param: OS::stack_name
+  server_port:
+    properties:
+      fixed_ips:
+      - subnet_id:
+          get_param: private_subnet_name
+      network_id:
+        get_param: private_net_name
+      security_groups:
+      - bin-redis
+    type: OS::Neutron::Port
+  root_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - redis
+      size: 20
+      volume_type: ssd
+      image: ubuntu-jammy-22-x86_64
+  cron_name:
+    type: OS::Heat::RandomString
+    condition: backup_res
+    properties:
+      salt:
+        get_param: OS::stack_name
+  volume_backup:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: redis-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+  wait_condition:
+    properties:
+      handle:
+        get_resource: wait_handle
+      timeout: 1000
+    type: OS::Heat::WaitCondition
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle

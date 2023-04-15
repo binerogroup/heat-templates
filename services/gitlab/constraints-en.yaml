@@ -1,0 +1,12 @@
+parameters:
+- name: local_net
+  type: private_network
+  constraints:
+  - action: filter
+    depends_on: availability_zone
+    depends_on_type: availability_zone
+- name: availability_zone
+  type: availability_zone
+  constraints:
+  - action: dropdown
+    dropdown_constraint: nova.az
