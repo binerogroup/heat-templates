@@ -1,0 +1,6 @@
+parameters:
+- name: availability_zone
+  type: availability_zone
+  constraints:
+  - action: dropdown
+    dropdown_constraint: nova.az

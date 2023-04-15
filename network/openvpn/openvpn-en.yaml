@@ -1,0 +1,290 @@
+heat_template_version: rocky
+description: pfSense VPN Server
+parameter_groups:
+- label: General
+  dscription: General parameters
+  parameters:
+  - admin_key
+  - admin_ranges
+  - vpn_instance_type
+  - availability_zone
+  - net
+  - backup
+  - backup_days
+parameters:
+  admin_key:
+    type: string
+    label: Admin SSH key pair
+    constraints:
+    - custom_constraint: nova.keypair
+  admin_ranges:
+    type: comma_delimited_list
+    label: Admin IP ranges
+    description: Comma delimited list of IP ranges (CIDR notation) for admin access
+    default: 127.0.0.1/32
+  vpn_instance_type:
+    type: string
+    label: pfSense instance flavor
+    constraints:
+    - custom_constraint: nova.flavor
+    default: gp.1x2
+  availability_zone:
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b
+    type: string
+  net:
+    constraints:
+    - custom_constraint: neutron.network
+    label: Private network
+    description: Name of network to connect pfSense
+    type: string
+    default: private
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Backup
+  backup_days:
+    label: Backup days
+    type: number
+    default: 10
+    description: Days to save the backup
+conditions:
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: net
+      security_groups:
+      - default
+      - get_resource: sec_mgmt
+      - get_resource: sec_vpn
+  sec_mgmt:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - management
+      rules:
+        repeat:
+          for_each:
+            <%port%>:
+            - '22'
+            - '80'
+            - '443'
+            <%range%>:
+              get_param: admin_ranges
+          template:
+            protocol: tcp
+            port_range_min: <%port%>
+            port_range_max: <%port%>
+            remote_ip_prefix: <%range%>
+  sec_vpn:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - openvpn
+      rules:
+      - protocol: udp
+        port_range_min: 1194
+        port_range_max: 1194
+        remote_ip_prefix: 0.0.0.0/0
+  sec_access:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - access
+      rules:
+      - remote_mode: remote_group_id
+        remote_group_id:
+          get_resource: sec_vpn
+  vpn_float_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network:
+        list_join:
+        - '-'
+        - - str_replace:
+              template:
+                get_param: availability_zone
+              params:
+                se-1: se-1-1
+          - net0
+  vpn_float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id:
+        get_resource: vpn_float_ip
+      port_id:
+        get_resource: port
+  vpn_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        get_param: OS::stack_name
+      flavor:
+        get_param: vpn_instance_type
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: root_volume
+      availability_zone:
+        get_param: availability_zone
+      key_name:
+        get_param: admin_key
+      networks:
+      - port:
+          get_resource: port
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: '#!/bin/sh
+
+            openssl req -batch -config /etc/ssl/openssl.cnf -newkey ec -pkeyopt ec_paramgen_curve:secp384r1
+            -nodes -keyout /root/ca.key -new -x509 -subj "/CN=OpenVPN CA" -days 3650
+            -sha384 -extensions v3_ca -out /root/ca.crt
+
+            CA_CERT=`b64encode -r /root/ca.crt - | tr -d ''\n''`
+
+            CA_KEY=`b64encode -r /root/ca.key - | tr -d ''\n''`
+
+            SERVER_CERT=`openssl req -batch -config /etc/ssl/openssl.cnf -newkey ec
+            -pkeyopt ec_paramgen_curve:secp384r1 -nodes -keyout /root/server.key -new
+            -subj "/CN=OpenVPN Server" -sha384 | openssl x509 -extfile /etc/ssl/openssl.cnf
+            -req -CAkey ca.key -CA ca.crt -days 398 -sha384 -extensions server -set_serial
+            1 | b64encode -r - | tr -d ''\n''`
+
+            SERVER_KEY=`b64encode -r /root/server.key - | tr -d ''\n''`
+
+            CLIENT_CERT=`openssl req -batch -config /etc/ssl/openssl.cnf -newkey ec
+            -pkeyopt ec_paramgen_curve:secp384r1 -nodes -keyout /root/client.key -new
+            -subj "/CN=OpenVPN User" -sha384 | openssl x509 -extfile /etc/ssl/openssl.cnf
+            -req -CAkey ca.key -CA ca.crt -days 398 -sha384 -extensions usr_cert -set_serial
+            2 | b64encode -r - | tr -d ''\n''`
+
+            CLIENT_KEY=`b64encode -r /root/client.key - | tr -d ''\n''`
+
+            rm -f /root/*.crt /root/*.key
+
+            TLS_SECRET=`/usr/local/sbin/openvpn --genkey secret /dev/stdout | b64encode
+            -r - | tr -d ''\n''`
+
+            pkg install -y pfSense-pkg-openvpn-client-export
+
+            cp /conf.default/config.xml.openvpn /conf.default/config.xml
+
+            sed -i '''' -e "s^CA_KEY^$CA_KEY^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^CA_CERT^$CA_CERT^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^SERVER_KEY^$SERVER_KEY^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^SERVER_CERT^$SERVER_CERT^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^CLIENT_KEY^$CLIENT_KEY^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^CLIENT_CERT^$CLIENT_CERT^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^TLS_SECRET^$TLS_SECRET^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^FLOATING_IP^!FLOATING_IP!^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^LOCAL_NETWORK^!LOCAL_NETWORK!^g" /conf.default/config.xml
+
+            sed -i '''' -e "s^<tls_type>auth^<tls_type>crypt^g" /conf.default/config.xml
+
+            echo "wc_notify --data-binary ''{\"status\": \"SUCCESS\"}''" >/tmp/final.sh
+
+            '
+          params:
+            '!FLOATING_IP!':
+              get_attr:
+              - vpn_float_ip
+              - floating_ip_address
+            '!LOCAL_NETWORK!':
+              get_attr:
+              - port
+              - subnets
+              - 0
+              - cidr
+            wc_notify:
+              get_attr:
+              - wait_handle
+              - curl_cli
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle:
+        get_resource: wait_handle
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+  root_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - vpn
+      size: 20
+      volume_type: ssd
+      image: pfsense-ce-2.6.0-x86_64
+  cron_name:
+    type: OS::Heat::RandomString
+    condition: backup_res
+    properties:
+      salt:
+        get_param: OS::stack_name
+  volume_backup1:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: openvpn-root-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+outputs:
+  mgmt_url:
+    value:
+      str_replace:
+        template: https://host/
+        params:
+          host:
+            get_attr:
+            - vpn_float_ip
+            - floating_ip_address
+    description: The URL with which you can access the Admin WebUI

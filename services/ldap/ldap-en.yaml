@@ -1,0 +1,217 @@
+heat_template_version: rocky
+description: LDAP
+parameter_groups:
+- label: General
+  dscription: General parameters
+  parameters:
+  - key
+  - flavor
+  - volume_size
+  - availability_zone
+  - local_net
+  - backup
+  - backup_days
+parameters:
+  flavor:
+    type: string
+    description: Flavor to be used
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  key:
+    type: string
+    description: Key pair name (the name can be found under Key Pairs / SSH-nycklar)
+    constraints:
+    - custom_constraint: nova.keypair
+  local_net:
+    type: string
+    description: The local network you want the server to be attached on
+    constraints:
+    - custom_constraint: neutron.network
+  availability_zone:
+    label: Availability zone
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b
+    type: string
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Backup of root volume
+  backup_days:
+    label: Backup days
+    type: number
+    default: 10
+    description: Days backup will be saved before deleted
+  volume_size:
+    description: Size of volume
+    default: 20
+    type: string
+conditions:
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+resources:
+  ldap-primary-cloudconfig:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        password:
+          get_resource: cloud-user_password
+        runcmd:
+        - dnf copr enable @389ds/389-directory-server -y
+        - dnf install 389-ds-base cockpit-389-ds -y
+        - systemctl enable cockpit.socket
+        - systemctl start cockpit.socket
+        - dnf update -y
+  pri_port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+      - get_resource: sec_ssh
+      - get_resource: sec_web
+      - get_resource: sec_ldap
+  ldap-primary-server:
+    type: OS::Nova::Server
+    depends_on:
+    - pri_port
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ldap-pri
+      flavor:
+        get_param: flavor
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: primary_root_volume
+      networks:
+      - port:
+          get_resource: pri_port
+      key_name:
+        get_param: key
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: ldap-primary-cloudconfig
+  primary_root_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - pri
+      size:
+        get_param: volume_size
+      volume_type: ssd
+      image: centos-stream-9-x86_64
+  sec_web:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - web
+      rules:
+      - protocol: tcp
+        port_range_min: 9090
+        port_range_max: 9090
+        remote_ip_prefix: 0.0.0.0/0
+  sec_ldap:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ldap
+      rules:
+      - protocol: tcp
+        port_range_min: 389
+        port_range_max: 389
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 636
+        port_range_max: 636
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 9830
+        port_range_max: 9830
+        remote_ip_prefix: 0.0.0.0/0
+  sec_ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ssh
+      rules:
+      - protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+  cloud-user_password:
+    type: OS::Heat::RandomString
+    properties:
+      length: 7
+      salt:
+        get_param: OS::stack_name
+  cron_name:
+    type: OS::Heat::RandomString
+    condition: backup_res
+    properties:
+      salt:
+        get_param: OS::stack_name
+  volume_backup1:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: ldap-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: primary_root_volume
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+outputs:
+  cloud-user_password:
+    description: Password for "cloud-user" use this to logon the webui
+    value:
+      get_resource: cloud-user_password
+  web_ui:
+    description: web url
+    value:
+      str_replace:
+        template: https://host:9090
+        params:
+          host:
+            get_attr:
+            - ldap-primary-server
+            - first_address

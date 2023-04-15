@@ -1,0 +1,426 @@
+heat_template_version: rocky
+description: Loadbalanced Apache LB setup
+parameter_groups:
+- label: General
+  description: General project parameters
+  parameters:
+  - key
+  - local_net
+  - subnet
+  - disk_type
+  - backup
+  - backup_days
+- label: Database server
+  description: Database server parameters
+  parameters:
+  - db_flavor
+- label: Webservers
+  description: Webserver parameters
+  parameters:
+  - web_count
+  - web_flavor
+- label: NFSserver
+  description: NFSserver parameters
+  parameters:
+  - nfs_flavor
+parameters:
+  key:
+    type: string
+    description: Key pair name (the name can be found under Key Pairs / SSH-nycklar)
+    constraints:
+    - custom_constraint: nova.keypair
+  local_net:
+    type: string
+    description: The local network you want the server to be attached on (a floating
+      IP will automatically be associated with this interface)
+    constraints:
+    - custom_constraint: neutron.network
+  db_flavor:
+    type: string
+    description: Flavor to be used for the nfsserver
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  web_count:
+    type: string
+    description: The number of webbservers that should be deployed
+    default: 1
+  web_flavor:
+    type: string
+    description: Flavor to be used for the webserver
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  nfs_flavor:
+    type: string
+    description: Flavor to be used for the sqlserver
+    default: gp.2x4
+    constraints:
+    - custom_constraint: nova.flavor
+  subnet:
+    type: string
+    description: The name of the subnet on your local_net
+    constraints:
+    - custom_constraint: neutron.subnet
+  disk_type:
+    label: Disk type ssd or hdd
+    type: string
+    default: ssd
+    description: null
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Backup of nfs and db volume
+  backup_days:
+    label: Backup days
+    type: number
+    default: 10
+    description: Days backup will be saved before deleted
+conditions:
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+resources:
+  loadbalancer:
+    type: OS::Octavia::LoadBalancer
+    properties:
+      vip_subnet:
+        get_param: subnet
+  lb_float_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: europe-se-1-1a-net0
+      port_id:
+        get_attr:
+        - loadbalancer
+        - vip_port_id
+  listenerhttp:
+    type: OS::Octavia::Listener
+    properties:
+      protocol_port: 80
+      protocol: HTTP
+      loadbalancer:
+        get_resource: loadbalancer
+  lb_poolhttp:
+    type: OS::Octavia::Pool
+    properties:
+      lb_algorithm: ROUND_ROBIN
+      listener:
+        get_resource: listenerhttp
+      protocol: HTTP
+  lb_monitorhttp:
+    type: OS::Octavia::HealthMonitor
+    properties:
+      delay: 3
+      max_retries: 3
+      pool:
+        get_resource: lb_poolhttp
+      timeout: 3
+      type: HTTP
+      expected_codes: 200,201,302,212
+      http_method: HEAD
+  listenerhttps:
+    type: OS::Octavia::Listener
+    properties:
+      protocol_port: 443
+      protocol: HTTPS
+      loadbalancer:
+        get_resource: loadbalancer
+  lb_poolhttps:
+    type: OS::Octavia::Pool
+    properties:
+      lb_algorithm: ROUND_ROBIN
+      session_persistence:
+        type: SOURCE_IP
+      listener:
+        get_resource: listenerhttps
+      protocol: HTTPS
+  lb_monitorhttps:
+    type: OS::Octavia::HealthMonitor
+    properties:
+      delay: 3
+      max_retries: 3
+      pool:
+        get_resource: lb_poolhttps
+      timeout: 3
+      type: HTTPS
+      expected_codes: 200,201,302,212
+      http_method: HEAD
+  dbconfig:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_upgrade: true
+        packages:
+        - mariadb-server
+        package_update: true
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        password: ubuntu
+        runcmd:
+        - sed -i 's/127.0.0.1/0.0.0.0/g' /etc/mysql/mariadb.conf.d/50-server.cnf
+        - service mysql restart
+  dbserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - db
+      flavor:
+        get_param: db_flavor
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: root_volume_db
+      networks:
+      - network:
+          get_param: local_net
+      security_groups:
+      - get_resource: sec_ssh
+      - get_resource: sec_sql
+      key_name:
+        get_param: key
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: dbconfig
+  webserver:
+    type: OS::Heat::ResourceGroup
+    properties:
+      count:
+        get_param: web_count
+      resource_def:
+        type: https://storage.binero.net/index.php/s/a5zTRrH3TJXGxKQ/download/webserver.yaml
+        properties:
+          name:
+            list_join:
+            - _
+            - - get_param: OS::stack_name
+              - web_%index%
+          flavor:
+            get_param: web_flavor
+          key:
+            get_param: key
+          local_net:
+            get_param: local_net
+          pool_http:
+            get_resource: lb_poolhttp
+          pool_https:
+            get_resource: lb_poolhttps
+          sec_web:
+            get_resource: sec_web
+          sec_ssh:
+            get_resource: sec_ssh
+          nfs_ip:
+            get_attr:
+            - nfsserver
+            - first_address
+          disk:
+            get_param: disk_type
+    depends_on: nfsserver
+  nfsconfig:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_upgrade: true
+        packages:
+        - nfs-kernel-server
+        package_update: true
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        password: ubuntu
+        write_files:
+        - path: /etc/exports
+          content: '/var/web/www *(rw,no_subtree_check,no_root_squash,sync)
+
+            /var/web/sites-enabled *(rw,no_subtree_check,no_root_squash,sync)
+
+            /var/web/sites-available *(rw,no_subtree_check,no_root_squash,sync)
+
+            /var/web/ssl *(rw,no_subtree_check,no_root_squash,sync)
+
+            '
+        - path: /var/web/sites-available/000-default.conf
+          content: "<VirtualHost *:80>\n\n    #ServerName www.example.com\n\n    ServerAdmin
+            webmaster@localhost\n    DocumentRoot /var/www/web\n\n\n    ErrorLog ${APACHE_LOG_DIR}/error.log\n
+            \   CustomLog ${APACHE_LOG_DIR}/access.log combined\n\n</VirtualHost>\n"
+        runcmd:
+        - mkdir /var/web
+        - mkdir /var/web/www
+        - mkdir /var/web/ssl
+        - mkdir /var/web/sites-enabled
+        - mkdir /var/web/sites-available
+        - chmod 0755 /var/web
+        - systemctl restart nfs-kernel-server
+  nfsserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - nfs
+      flavor:
+        get_param: nfs_flavor
+      block_device_mapping:
+      - device_name: vda
+        delete_on_termination: true
+        volume_id:
+          get_resource: root_volume_nfs
+      networks:
+      - network:
+          get_param: local_net
+      security_groups:
+      - get_resource: sec_ssh
+      - get_resource: sec_web
+      - get_resource: sec_nfs
+      key_name:
+        get_param: key
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: nfsconfig
+  sec_web:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - web
+      rules:
+      - protocol: tcp
+        port_range_min: 80
+        port_range_max: 80
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 443
+        port_range_max: 443
+        remote_ip_prefix: 0.0.0.0/0
+  sec_ssh:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ssh
+      rules:
+      - protocol: tcp
+        port_range_min: 22
+        port_range_max: 22
+        remote_ip_prefix: 0.0.0.0/0
+  sec_sql:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - db
+      rules:
+      - protocol: tcp
+        port_range_min: 3306
+        port_range_max: 3306
+        remote_ip_prefix: 0.0.0.0/0
+  sec_nfs:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - nfs
+      rules:
+      - protocol: tcp
+        port_range_min: 2049
+        port_range_max: 2049
+        remote_ip_prefix: 0.0.0.0/0
+      - protocol: tcp
+        port_range_min: 111
+        port_range_max: 111
+        remote_ip_prefix: 0.0.0.0/0
+  root_volume_db:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - db
+      size: 20
+      volume_type:
+        get_param: disk_type
+      image: ubuntu-jammy-22-x86_64
+  root_volume_nfs:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - nfs
+      size: 20
+      volume_type:
+        get_param: disk_type
+      image: ubuntu-jammy-22-x86_64
+  cron_name:
+    type: OS::Heat::RandomString
+    condition: backup_res
+    properties:
+      salt:
+        get_param: OS::stack_name
+  volume_backup1:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: lamplb-nfs-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume_nfs
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+  volume_backup2:
+    type: OS::Mistral::CronTrigger
+    condition: backup_res
+    properties:
+      name:
+        str_replace:
+          template: lamplb-db-$name
+          params:
+            $name:
+              get_attr:
+              - cron_name
+              - value
+      pattern: 0 0 * * *
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume_db
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days

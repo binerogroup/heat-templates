@@ -1,0 +1,290 @@
+heat_template_version: wallaby
+description: Site-to-site IPSec tunnel through pfSense
+parameter_groups:
+- label: General
+  description: General parameters
+  parameters:
+  - admin_key
+  - admin_ranges
+  - instance_type
+  - availability_zone
+  - net
+- label: IPSec
+  description: IPSec parameters
+  parameters:
+  - peer_ip
+  - remote_net
+  - ipsec_psk
+parameters:
+  admin_key:
+    type: string
+    label: Admin SSH key pair
+    constraints:
+    - custom_constraint: nova.keypair
+  admin_ranges:
+    type: comma_delimited_list
+    label: Admin IP ranges
+    description: Comma delimited list of IP ranges (CIDR notation) for admin access
+    default: 127.0.0.1/32
+  instance_type:
+    type: string
+    label: pfSense instance flavor (hp.2x4 can provide about 1 Gbps throughput)
+    constraints:
+    - custom_constraint: nova.flavor
+    default: hp.2x4
+  availability_zone:
+    default: europe-se-1a
+    label: Availability Zone
+    description: The availability zone to launch the instance in. Available options
+      are europe-se-1a and europe-se-1b
+    type: string
+  net:
+    constraints:
+    - custom_constraint: neutron.network
+    label: Private network
+    description: Name of network to connect pfSense to
+    type: string
+    default: private
+  peer_ip:
+    label: IPSec peer IP
+    description: IP to IPSec peer gateway
+    type: string
+  remote_net:
+    label: IPSec remote network
+    description: IPSec peer remote network (CIDR)
+    type: string
+  ipsec_psk:
+    label: IPSec Pre-Shared Key
+    description: IPSec pre-shared key (leave * for random)
+    type: string
+    default: '*'
+    constraints:
+    - length:
+        min: 0
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: net
+      security_groups:
+      - default
+      - get_resource: sec_mgmt
+      - get_resource: sec_ipsec
+      allowed_address_pairs:
+      - ip_address:
+          get_param: remote_net
+  sec_mgmt:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - management
+      rules:
+        repeat:
+          for_each:
+            <%port%>:
+            - '22'
+            - '80'
+            - '443'
+            <%range%>:
+              get_param: admin_ranges
+          template:
+            protocol: tcp
+            port_range_min: <%port%>
+            port_range_max: <%port%>
+            remote_ip_prefix: <%range%>
+  sec_ipsec:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - ipsec
+      rules:
+        list_concat:
+        - repeat:
+            for_each:
+              <%proto%>:
+              - esp
+              - ah
+            template:
+              protocol: <%proto%>
+              remote_ip_prefix:
+                list_join:
+                - /
+                - - get_param: peer_ip
+                  - '32'
+        - repeat:
+            for_each:
+              <%port%>:
+              - '500'
+              - '4500'
+            template:
+              protocol: udp
+              port_range_min: <%port%>
+              port_range_max: <%port%>
+              remote_ip_prefix:
+                list_join:
+                - /
+                - - get_param: peer_ip
+                  - '32'
+  sec_access:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name:
+        list_join:
+        - _
+        - - get_param: OS::stack_name
+          - access
+      rules:
+      - remote_ip_prefix:
+          list_join:
+          - /
+          - - get_param: peer_ip
+            - '32'
+      - remote_mode: remote_group_id
+        remote_group_id:
+          get_resource: sec_ipsec
+  float_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network:
+        list_join:
+        - '-'
+        - - str_replace:
+              template:
+                get_param: availability_zone
+              params:
+                se-1: se-1-1
+          - net0
+  float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id:
+        get_resource: float_ip
+      port_id:
+        get_resource: port
+  admin_password:
+    type: OS::Heat::RandomString
+  pfsense_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        get_param: OS::stack_name
+      flavor:
+        get_param: instance_type
+      image: pfsense-ce-2.6.0-x86_64
+      availability_zone:
+        get_param: availability_zone
+      key_name:
+        get_param: admin_key
+      networks:
+      - port:
+          get_resource: port
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: "#!/bin/sh\nSHADOW_HASH=`echo \"!ADMIN_PASSWORD!\" | openssl passwd
+            -6 -stdin`\nIPSEC_PSK=\"!IPSEC_PSK!\"\nif [ -z \"$IPSEC_PSK\" ] || [ \"$IPSEC_PSK\"
+            == \"*\" ]; then\n  IPSEC_PSK=`dd status=none if=/dev/random bs=4096 count=1
+            | openssl sha224 | cut -f2 -d' '`\nfi\nfetch -o /conf.default/config.xml
+            https://dilworth.se/pfsense/config.xml.ipsec\nsed -i '' -e \"s^<sha512-hash>.*<^<sha512-hash>$SHADOW_HASH<^g\"
+            /conf.default/config.xml\nsed -i '' -e \"s^IPSEC_PEER^!IPSEC_PEER!^g\"
+            /conf.default/config.xml\nsed -i '' -e \"s^IPSEC_PSK^$IPSEC_PSK^g\" /conf.default/config.xml\nsed
+            -i '' -e \"s^IPSEC_REMOTE_NET^!IPSEC_REMOTE_NET!^g\" /conf.default/config.xml\nsed
+            -i '' -e \"s^IPSEC_REMOTE_MASK^!IPSEC_REMOTE_MASK!^g\" /conf.default/config.xml\nsed
+            -i '' -e \"s^FLOATING_IP^!FLOATING_IP!^g\" /conf.default/config.xml\nsed
+            -i '' -e \"s^LOCAL_NETWORK^!LOCAL_NETWORK!^g\" /conf.default/config.xml\necho
+            \"wc_notify --data-binary '{\\\"status\\\": \\\"SUCCESS\\\", \\\"data\\\":
+            \\\"$IPSEC_PSK\\\"}'\" >/tmp/final.sh\n"
+          params:
+            '!IPSEC_PSK!':
+              get_param: ipsec_psk
+            '!IPSEC_PEER!':
+              get_param: peer_ip
+            '!IPSEC_REMOTE_NET!':
+              str_split:
+              - /
+              - get_param: remote_net
+              - 0
+            '!IPSEC_REMOTE_MASK!':
+              str_split:
+              - /
+              - get_param: remote_net
+              - 1
+            '!FLOATING_IP!':
+              get_attr:
+              - float_ip
+              - floating_ip_address
+            '!LOCAL_NETWORK!':
+              get_attr:
+              - port
+              - subnets
+              - 0
+              - cidr
+            '!ADMIN_PASSWORD!':
+              get_resource: admin_password
+            wc_notify:
+              get_attr:
+              - wait_handle
+              - curl_cli
+  wait_condition:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle:
+        get_resource: wait_handle
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+outputs:
+  local_gw_ip:
+    value:
+      get_attr:
+      - port
+      - fixed_ips
+      - 0
+      - ip_address
+    description: Local IP address of the pfSense instance
+  ipsec_endpoint:
+    value:
+      get_attr:
+      - float_ip
+      - floating_ip_address
+    description: Our IPSec endpoint (IP and ID)
+  ipsec_psk:
+    value:
+      str_split:
+      - '"'
+      - get_attr:
+        - wait_condition
+        - data
+      - 3
+    description: IPSec Pre-Shared Key
+  mgmt_url:
+    value:
+      str_replace:
+        template: https://host/
+        params:
+          host:
+            get_attr:
+            - float_ip
+            - floating_ip_address
+    description: The URL with which you can access the Admin WebUI
+  admin_password:
+    value:
+      get_attr:
+      - admin_password
+      - value
+    description: Password for the "admin" account on the pfSense instance
+  documentation:
+    value: https://docs.binero.com/networking/site-to-site-vpn/index.html
+    description: General documentation for the site-to-site VPN service
+  remote_configuration:
+    value: https://docs.binero.com/networking/site-to-site-vpn/configure-remote.html
+    description: Documentation for remote-end configuration

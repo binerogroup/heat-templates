@@ -1,0 +1,67 @@
+heat_template_version: rocky
+description: Private network template
+parameters:
+  availability_zone:
+    type: string
+    description: The Availability zone to launch the instance in
+    default: europe-se-1a
+    constraints:
+    - allowed_values:
+      - europe-se-1a
+      - europe-se-1b
+  subnet_cidr:
+    type: string
+    label: Subnet (CIDR notation)
+  enable_dhcp:
+    type: boolean
+    label: Enable DHCP
+    default: true
+  nameservers:
+    type: comma_delimited_list
+    label: DNS Server addresses (comma separated)
+    default: 83.168.225.225,83.168.226.226
+resources:
+  network:
+    type: OS::Neutron::Net
+    properties:
+      name:
+        get_param: OS::stack_name
+      value_specs:
+        availability_zone_hints:
+        - get_param: availability_zone
+  subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_resource: network
+      cidr:
+        get_param: subnet_cidr
+      dns_nameservers:
+        get_param: nameservers
+  router:
+    type: OS::Neutron::Router
+    properties:
+      name:
+        get_param: OS::stack_name
+      external_gateway_info:
+        network:
+          list_join:
+          - '-'
+          - - str_replace:
+                template:
+                  get_param: availability_zone
+                params:
+                  se-1: se-1-1
+            - net0
+      value_specs:
+        availability_zone_hints:
+        - get_param: availability_zone
+  router_int:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router:
+        get_resource: router
+      subnet:
+        get_resource: subnet
