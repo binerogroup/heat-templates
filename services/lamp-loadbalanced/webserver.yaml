@@ -1,0 +1,109 @@
+heat_template_version: rocky
+
+parameters:
+  name:
+    type: string
+  flavor:
+    type: string
+  key:
+    type: string
+  local_net:
+    type: string
+  pool_http:
+    type: string
+  pool_https:
+    type: string
+  nfs_ip:
+    type: string
+  sec_web:
+    type: string
+  sec_ssh:
+    type: string
+  disk:
+    type: string
+
+conditions:
+  backup_res:
+    not:
+      equals:
+      - get_param: backup
+      - false
+
+resources:
+  webconfig:
+      type: OS::Heat::CloudConfig
+      properties:
+        cloud_config:
+          package_upgrade: true
+          packages:
+            - apache2
+            - nfs-common
+            - php-mysql
+            - libapache2-mod-php
+          package_update: true
+          package_upgrade: true
+          package_reboot_if_required: true
+          ssh_pwauth: no
+          chpasswd:
+            expire: false
+          password: ubuntu
+          write_files:
+            - path: /etc/fstab
+              append: true
+              content:
+                str_replace:
+                  template: |
+                     NFSHOST:/var/web/www /var/www/web nfs users,auto,rw  0  0
+                     NFSHOST:/var/web/ssl /etc/ssl/ssl nfs users,auto,rw  0  0
+                     NFSHOST:/var/web/sites-available /etc/apache2/sites-available nfs users,auto,rw  0  0
+                     NFSHOST:/var/web/sites-enabled /etc/apache2/sites-enabled nfs users,auto,rw  0  0
+                  params:
+                    NFSHOST: {get_param: nfs_ip}
+
+          runcmd:
+            - mkdir /var/www/web
+            - mkdir /etc/ssl/ssl
+            - chmod 0755 /var/www/web
+            - a2enmod rewrite
+            - systemctl restart apache2
+
+  webserver:
+    type: OS::Nova::Server
+    properties:
+      name: { get_param: name }
+      flavor: { get_param: flavor }
+      block_device_mapping:
+        - device_name: vda
+          delete_on_termination: true
+          volume_id: { get_resource: root_volume }
+      networks:
+        - network: { get_param: local_net }
+      security_groups:
+          - get_param: sec_ssh
+          - get_param: sec_web
+      key_name: { get_param: key }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: webconfig }
+
+
+  pool_memberhttp:
+    type: OS::Octavia::PoolMember
+    properties:
+      address: { get_attr: [ webserver, networks, { get_param: local_net }, 0 ] }
+      pool: { get_param: pool_http }
+      protocol_port: 80
+
+  pool_memberhttps:
+    type: OS::Octavia::PoolMember
+    properties:
+      address: { get_attr: [ webserver, networks, { get_param: local_net }, 0 ] }
+      pool: { get_param: pool_https }
+      protocol_port: 443
+
+  root_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name: { list_join: [ _, [ { get_param: OS::stack_name }, web ] ] }
+      size: 20
+      volume_type: {get_param: disk}
+      image: ubuntu-jammy-22-x86_64
