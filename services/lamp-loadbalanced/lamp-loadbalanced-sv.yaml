@@ -26,44 +26,43 @@ parameter_groups:
 parameters:
   key:
     type: string
-    description: Key pair name (the name can be found under Key Pairs / SSH-nycklar)
+    description: SSH-Nyckel
     constraints:
     - custom_constraint: nova.keypair
   local_net:
     type: string
-    description: The local network you want the server to be attached on (a floating
-      IP will automatically be associated with this interface)
+    description: "Det lokala n\xE4tet som samtliga server kommer sitta p\xE5."
     constraints:
     - custom_constraint: neutron.network
   db_flavor:
     type: string
-    description: Flavor to be used for the sqlserver
+    description: Prestandan du vill att db-instanse ska ha
     default: gp.4x8
     constraints:
     - custom_constraint: nova.flavor
   web_count:
     type: string
-    description: The number of webbservers that should be deployed
+    description: "Antalet web-instanser som ska s\xE4ttas upp"
     default: 1
   web_flavor:
     type: string
-    description: Flavor to be used for the webserver
+    description: Prestandan du vill att web-instanse ska ha
     default: gp.4x8
     constraints:
     - custom_constraint: nova.flavor
   nfs_flavor:
     type: string
-    description: Flavor to be used for the nfsserver
+    description: Prestandan du vill att nfs-instanse ska ha
     default: gp.2x4
     constraints:
     - custom_constraint: nova.flavor
   subnet:
     type: string
-    description: The name of the subnet on your local_net
+    description: "V\xE4lj subnet som sitter p\xE5 de local_net du valt"
     constraints:
     - custom_constraint: neutron.subnet
   disk_type:
-    label: Disk type ssd or hdd
+    label: Disk typ ssd eller hdd
     type: string
     default: ssd
     description: null
@@ -71,12 +70,12 @@ parameters:
     label: Backup
     type: boolean
     default: false
-    description: Backup of nfs and db volume
+    description: "Backup tas p\xE5 NFS och DB instansen"
   backup_days:
-    label: Backup days
+    label: Backup dagar
     type: number
     default: 10
-    description: Days backup will be saved before deleted
+    description: Antal dagar backup av volymer ska sparas
 conditions:
   backup_res:
     not:
