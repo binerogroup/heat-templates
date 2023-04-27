@@ -59,9 +59,9 @@ parameters:
     - custom_constraint: nova.flavor
   subnet:
     type: string
-    description: The name of the subnet on your local_net
-    constraints:
-    - custom_constraint: neutron.subnet
+    description: The name of the subnet on your local_net 
+#    constraints: #this constraints let you choose subnet from dropdown list. but this is not working without binerocloud constraints
+#    - custom_constraint: neutron.subnet
   disk_type:
     label: Disk type ssd or hdd
     type: string

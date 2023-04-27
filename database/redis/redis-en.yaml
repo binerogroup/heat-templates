@@ -31,8 +31,8 @@ parameters:
   private_subnet_name:
     description: Private subnetwork to use for instance to be created.
     type: string
-    constraints:
-    - custom_constraint: neutron.subnet
+ #   constraints:  #this constraints let you choose subnet from dropdown list. but this is not working without binerocloud constraints
+ #   - custom_constraint: neutron.subnet 
   backup:
     label: Backup
     type: boolean
