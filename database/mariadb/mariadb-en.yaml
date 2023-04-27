@@ -18,7 +18,7 @@ parameters:
     type: string
     description: Key pair name (If you see nothing you need to first create a key
       under SSH-KEY)
-    constraints:  ##This constraint let you choose ssh-key from a dropdown list 
+    constraints:
     - custom_constraint: nova.keypair
   local_net:
     label: Local network
