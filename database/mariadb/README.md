@@ -1,5 +1,1 @@
-Mariadb on Ubuntu22 with the option for database dumps and replication
-
-Replication - You get the option to select replication, this will deploy a secondary Mariadb instance that will act as secondary and read from the primary.
-
-Database dump -  This option will dump all your databases daily on the primary instance at 06.25 into folder /home/ubuntu/sql_dump. The dump gets removed after 30 days.
+Creates a MariaDB 10.11 replication cluster using Ubuntu 22.04

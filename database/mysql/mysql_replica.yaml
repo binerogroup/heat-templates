@@ -1,0 +1,171 @@
+heat_template_version: wallaby
+
+parameters:
+  stack_name:
+    type: string
+  index:
+    type: number
+  flavor:
+    type: string
+  sec_groups:
+    type: json
+  admin_key:
+    type: string
+  az:
+    type: string
+  net:
+    type: string
+  pri_ip:
+    type: string
+  data_size:
+    type: number
+  repl_pass:
+    type: json
+  multi_site:
+    type: string
+  primary_site:
+    type: boolean
+
+conditions:
+  primary_site: { get_param: primary_site }
+  use_floating_ip:
+    and:
+    - equals: [ true, { get_param: multi_site } ]
+    - not:
+        contains:
+        - get_param: net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: stack_name }
+            id: { get_param: index }
+            primary: { get_param: primary_site }
+            az: { get_param: az }
+      network: { get_param: net }
+      security_groups: { get_param: sec_groups }
+  float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: use_floating_ip
+    properties:
+      floating_network: { list_join: [ -, [ { str_replace: { template: { get_param: az }, params: { se-1: se-1-1 } } }, net0 ] ] }
+  float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: use_floating_ip
+    properties:
+      floatingip_id: { get_resource: float_ip }
+      port_id: { get_resource: port }
+  config:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_upgrade: true
+        packages:
+        - console-setup
+        - ncurses-term
+        - screen
+        - tcpdump
+        - net-tools
+        - mysql-server
+        package_update: true
+        package_reboot_if_required: true
+        keyboard:
+          layout: se
+        timezone: Europe/Stockholm
+        ssh_pwauth: false
+        disable_root: false
+        manage_etc_hosts: true
+        swap:
+          filename: /swapfile
+          size: 2G
+          maxsize: 2G
+        apt:
+          debconf_selections:
+            unattended_upgrades: unattended-upgrades unattended-upgrades/enable_auto_updates boolean false
+        write_files:
+        - path: /etc/apt/apt.conf.d/20auto-upgrades
+          content: |
+            APT::Periodic::Update-Package-Lists "0";
+            APT::Periodic::Unattended-Upgrade "0";
+        - path: /etc/sysctl.d/99-mysqld.conf
+          content: |
+            vm.swappiness = 1
+        runcmd:
+        - dpkg-reconfigure -fnoninteractive unattended-upgrades
+        - apt-get autoremove -y
+        - sysctl --system
+        - sed -i '/^XKBLAYOUT=/s/=.*/="se"/' /etc/default/keyboard
+        - setupcon
+        - sed -i '/bind-address\s*=/s/=.*/= 0.0.0.0/g' /etc/mysql/mysql.conf.d/mysqld.cnf
+        - sed -i 's/\s*#\s*log_bin\s/log_bin\t/' /etc/mysql/mysql.conf.d/mysqld.cnf
+        - sed -i '/^max_binlog_size\s*=/s/=.*/= 500M/' /etc/mysql/mysql.conf.d/mysqld.cnf
+        - str_replace:
+            template: |
+              echo 'server-id\t= !ID!' >>/etc/mysql/mysql.conf.d/mysqld.cnf
+            params:
+              '!ID!':
+                yaql:
+                  expression: str($.data.id+1+int($.data.primary)+int(not $.data.primary)*40)
+                  data:
+                    id: { get_param: index }
+                    primary: { get_param: primary_site }
+        - echo 'relay_log\t= /var/log/mysql/relay-bin.log' >>/etc/mysql/mysql.conf.d/mysqld.cnf
+        - echo 'gtid_mode\t= ON' >>/etc/mysql/mysql.conf.d/mysqld.cnf
+        - echo 'enforce-gtid-consistency\t= ON' >>/etc/mysql/mysql.conf.d/mysqld.cnf
+        - echo 'read_only\t= 1' >>/etc/mysql/mysql.conf.d/mysqld.cnf
+        - systemctl restart mysql
+        - list_join: [ ' ', [ sleep, { yaql: { expression: str(60*$.data.id+int($.data.primary)*30), data: { id: { get_param: index }, primary: { get_param: primary_site } } } } ] ]
+        - str_replace:
+            template: |
+              mysql -e "
+              CHANGE REPLICATION SOURCE TO SOURCE_HOST = '!PRIMARY_IP!', SOURCE_USER = 'repl', SOURCE_PASSWORD = '!REPL_PASS!', SOURCE_AUTO_POSITION = 1, GET_SOURCE_PUBLIC_KEY = 1;
+              START REPLICA;"
+            params:
+              '!PRIMARY_IP!': { get_param: pri_ip }
+              '!REPL_PASS!': { get_param: [ repl_pass, '1' ] }
+        - list_join: [ ' ', [ { get_attr: [ wait_handle, curl_cli ] }, --data-binary, '''{"status": "SUCCESS"}''' ] ]
+  db_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: stack_name }
+            id: { get_param: index }
+            primary: { get_param: primary_site }
+            az: { get_param: az }
+      flavor: { get_param: flavor }
+      availability_zone: { get_param: az }
+      key_name: { get_param: admin_key }
+      block_device_mapping_v2:
+      - boot_index: 0
+        delete_on_termination: false
+        image: ubuntu-jammy-22-x86_64
+        volume_size:
+          yaql:
+            expression: int(max(6 + $.data.size, 20))
+            data:
+              size: { get_param: data_size }
+        disk_bus: virtio
+      networks:
+      - port: { get_resource: port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: config }
+      user_data_update_policy: IGNORE
+  bootstrap:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle

@@ -1,0 +1,424 @@
+heat_template_version: wallaby
+description: Creates a MariaDB 10.11 replication cluster using Ubuntu 22.04
+
+parameter_groups:
+- label: General
+  description: General parameters
+  parameters:
+  - admin_key
+  - db_flavor
+  - data_size
+  - replica_nodes
+  - pri_az
+  - pri_net
+  - alt_az
+  - alt_net
+- label: Backup
+  description: Backup options
+  parameters:
+  - backup
+  - backup_volume_size
+  - backup_retention
+
+parameters:
+  admin_key:
+    type: string
+    label: Admin SSH key
+    description: Admin key name (If you see nothing you need to first create a key under SSH-KEY)
+    constraints:
+    - custom_constraint: nova.keypair
+  db_flavor:
+    label: Instance flavor
+    type: string
+    description: Flavor to be used for database instances
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  data_size:
+    label: Estimated database size (in GB)
+    type: number
+    default: 4
+    description: This number is used to calculate the initial root volume size to accommodate MariaDB data
+  replica_nodes:
+    type: number
+    label: Replicas
+    description: Number of replica (read-only) database nodes. 0 creates a MariaDB instance without replication
+    default: 0
+  pri_az:
+    label: Primary availability zone
+    default: europe-se-1a
+    description: The availability zone for the primary network. Available options are europe-se-1a and europe-se-1b
+    type: string
+  pri_net:
+    label: Primary network
+    type: string
+    description: The network that the primary node (plus every uneven node if cluster) should be attached to
+    default: dummy
+    constraints:
+    - custom_constraint: neutron.network
+  alt_az:
+    label: Alternate availability zone
+    default: europe-se-1b
+    description: Alternate availability zone to launch every second replica node in.
+      Available options are europe-se-1a and europe-se-1b
+    type: string
+  alt_net:
+    constraints:
+    - custom_constraint: neutron.network
+    label: Alternate network
+    type: string
+    default: dummy
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Perform daily backups
+  backup_volume_size:
+    type: number
+    label: Backup volume size (in GB)
+    default: 10
+  backup_retention:
+    label: Backup retention (in days)
+    type: number
+    default: 7
+    description: Days for which backups will be kept
+
+conditions:
+  multi_nodes:
+    not: { equals: [ 0, { get_param: replica_nodes } ] }
+  multi_site:
+    and:
+    - not: { equals: [ 0, { get_param: replica_nodes } ] }
+    - not:
+        equals:
+        - get_param: pri_net
+        - get_param: alt_net
+  use_floating_ip:
+    and:
+    - not: { equals: [ 0, { get_param: replica_nodes } ] }
+    - not:
+        equals:
+        - get_param: pri_net
+        - get_param: alt_net
+    - not:
+        contains:
+        - get_param: pri_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+  sec_group_id_mode:
+    or:
+    - equals: [ 0, { get_param: replica_nodes } ]
+    - equals:
+      - get_param: pri_net
+      - get_param: alt_net
+    - and:
+      - contains:
+        - get_param: pri_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+      - contains:
+        - get_param: alt_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+  do_backup:
+    get_param: backup
+
+resources:
+  sg_cluster:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: [ -, [ { get_param: OS::stack_name }, cluster ] ] }
+      rules:
+      - protocol: tcp
+        port_range_min: 3306
+        port_range_max: 3306
+        remote_mode: { if: [ sec_group_id_mode, remote_group_id, remote_ip_prefix ] }
+  primary_backup_volume:
+    type: OS::Cinder::Volume
+    condition: do_backup
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]+"-db-backup"
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      volume_type: hdd
+      size: { get_param: backup_volume_size }
+      availability_zone: { get_param: pri_az }
+  pri_port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      network: { get_param: pri_net }
+      security_groups:
+      - default
+      - get_resource: sg_cluster
+  pri_float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: use_floating_ip
+    properties:
+      floating_network: { list_join: [ -, [ { str_replace: { template: { get_param: pri_az }, params: { se-1: se-1-1 } } }, net0 ] ] }
+  pri_float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: use_floating_ip
+    properties:
+      floatingip_id: { get_resource: pri_float_ip }
+      port_id: { get_resource: pri_port }
+  mariadb_root_password:
+    type: OS::Heat::RandomString
+    properties:
+      salt:
+        get_param: OS::stack_name
+  config_primary:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        map_merge:
+        - package_upgrade: true
+          packages:
+          - console-setup
+          - ncurses-term
+          - screen
+          - tcpdump
+          - net-tools
+          package_update: true
+          package_reboot_if_required: true
+          keyboard:
+            layout: se
+          timezone: Europe/Stockholm
+          ssh_pwauth: false
+          disable_root: false
+          manage_etc_hosts: true
+          swap:
+            filename: /swapfile
+            size: 2G
+            maxsize: 2G
+          apt:
+            debconf_selections:
+              unattended_upgrades: unattended-upgrades unattended-upgrades/enable_auto_updates boolean false
+          write_files:
+          - path: /etc/apt/apt.conf.d/20auto-upgrades
+            content: |
+              APT::Periodic::Update-Package-Lists "0";
+              APT::Periodic::Unattended-Upgrade "0";
+          - path: /etc/apt/preferences.d/mariadb-enterprise.pref
+            content: |
+              Package: *
+              Pin: origin dlm.mariadb.com
+              Pin-Priority: 1000
+          - path: /etc/apt/sources.list.d/mariadb.list
+            content: |
+              deb [signed-by=/usr/share/keyrings/mariadb-keyring-2019.gpg arch=amd64] https://dlm.mariadb.com/repo/mariadb-server/10.11/repo/ubuntu jammy main
+              deb [signed-by=/usr/share/keyrings/mariadb-keyring-2019.gpg arch=amd64] https://dlm.mariadb.com/repo/mariadb-server/10.11/repo/ubuntu jammy main/debug
+              deb [signed-by=/usr/share/keyrings/mariadb-keyring-2019.gpg arch=amd64] https://dlm.mariadb.com/repo/maxscale/latest/apt jammy main
+              deb [signed-by=/usr/share/keyrings/mariadb-keyring-2019.gpg arch=amd64] http://downloads.mariadb.com/Tools/ubuntu jammy main
+          - path: /etc/sysctl.d/99-mariadb.conf
+            content: |
+              vm.swappiness = 1
+          - path: /etc/cron.daily/mariadbbackup
+            permissions: { if: [ do_backup, '0770', '0660' ] }
+            content: |
+              #!/bin/sh
+              MYSQL=/usr/bin/mariadb
+              MYSQLDUMP=/usr/bin/mariadb-dump
+              BACKUPDIR=/mnt/backup/auto
+
+              mkdir -p "$BACKUPDIR"
+              databases=`$MYSQL -e "SHOW DATABASES;" | grep -Ev "(Database|sys|information_schema|performance_schema)"`
+
+              for db in $databases; do
+                $MYSQLDUMP -f --opt --single-transaction -R --triggers -r "$BACKUPDIR/$db.sql" "$db"
+              done
+              find "$BACKUPDIR" -mtime +1 -name "*.sql" -delete
+          runcmd:
+          - dpkg-reconfigure -fnoninteractive unattended-upgrades
+          - apt-get autoremove -y
+          - curl -sfLO --output-dir /usr/share/keyrings https://supplychain.mariadb.com/mariadb-keyring-2019.gpg
+          - apt update
+          - apt install -y mariadb-server mariadb-client mariadb-backup
+          - sysctl --system
+          - sed -i '/^XKBLAYOUT=/s/=.*/="se"/' /etc/default/keyboard
+          - setupcon
+          - sed -iE '/daily/s/^[[:digit:]]+\s[[:digit:]]+/30 2/' /etc/crontab
+          - sed -i '/bind-address\s*=/s/=.*/= 0.0.0.0/g' /etc/mysql/mariadb.conf.d/50-server.cnf
+          - echo log-bin >>/etc/mysql/mariadb.conf.d/50-server.cnf
+          - echo server_id=1 >>/etc/mysql/mariadb.conf.d/50-server.cnf
+          - echo log-basename=mysql >>/etc/mysql/mariadb.conf.d/50-server.cnf
+          - echo binlog-format=mixed >>/etc/mysql/mariadb.conf.d/50-server.cnf
+          - echo max_binlog_size=500M >>/etc/mysql/mariadb.conf.d/50-server.cnf
+          - echo relay_log=/var/log/mysql/relay-bin.log >>/etc/mysql/mariadb.conf.d/50-server.cnf
+          - systemctl restart mariadb
+          - export REPL_PASS=`openssl rand -base64 24`
+          - str_replace:
+              template: |
+                mariadb -e "
+                CREATE USER 'root'@'%' IDENTIFIED BY '!ROOT_PASS!';
+                GRANT ALL PRIVILEGES ON *.* TO 'root'@'%' WITH GRANT OPTION;
+                CREATE USER 'repl'@'%' IDENTIFIED BY '$REPL_PASS';
+                GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';"
+              params:
+                '!ROOT_PASS!': { get_attr: [ mariadb_root_password, value ] }
+          - list_join: [ ' ', [ { get_attr: [ wait_handle, curl_cli ] }, --data-binary, '"{\"status\": \"SUCCESS\", \"data\": \"$REPL_PASS\"}"' ] ]
+        - if:
+          - do_backup
+          - disk_setup: { /dev/vdb: { table_type: gpt, layout: true } }
+            fs_setup:
+            - label: backupvol
+              filesystem: ext4
+              device: /dev/vdb
+              partition: 1
+            mounts: [ [ LABEL=backupvol, /mnt/backup, ext4, 'defaults,noatime' ] ]
+          - { }
+  primary_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      flavor: { get_param: db_flavor }
+      availability_zone: { get_param: pri_az }
+      key_name: { get_param: admin_key }
+      block_device_mapping_v2:
+        list_concat:
+        - - boot_index: 0
+            delete_on_termination: false
+            image: ubuntu-jammy-22-x86_64
+            volume_size:
+              yaql:
+                expression: int(max(6 + $.data.size, 20))
+                data:
+                  size: { get_param: data_size }
+            disk_bus: virtio
+        - if:
+          - do_backup
+          - - boot_index: -1
+              delete_on_termination: false
+              volume_id: { get_resource: primary_backup_volume }
+              disk_bus: virtio
+          - [ ]
+      networks:
+      - port: { get_resource: pri_port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: config_primary }
+      user_data_update_policy: IGNORE
+  primary_bootstrap:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+  primary_site_replica_nodes:
+    type: OS::Heat::ResourceGroup
+    condition: multi_nodes
+    properties:
+      index_var: <%index%>
+      count:
+        yaql:
+          expression: $.data.count / $.data.divisor
+          data:
+            count: { get_param: replica_nodes }
+            divisor: { if: [ multi_site, 2, 1 ] }
+      resource_def:
+        type: https://raw.githubusercontent.com/binerogroup/heat-templates/main/database/mariadb/mariadb_replica.yaml
+        properties:
+          stack_name: { get_param: OS::stack_name }
+          index: <%index%>
+          flavor: { get_param: db_flavor }
+          sec_groups:
+          - default
+          - get_resource: sg_cluster
+          admin_key: { get_param: admin_key }
+          az: { get_param: pri_az }
+          net: { get_param: pri_net }
+          pri_ip:
+            if:
+            - use_floating_ip
+            - get_attr: [ pri_float_ip, floating_ip_address ]
+            - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+          data_size: { get_param: data_size }
+          repl_pass: { get_attr: [ primary_bootstrap, data ] }
+          multi_site: { if: [ multi_site, true, false ] }
+          primary_site: true
+  secondary_site_nodes:
+    type: OS::Heat::ResourceGroup
+    condition: multi_site
+    properties:
+      index_var: <%index%>
+      count:
+        yaql:
+          expression: ($.data.count / 2) + ($.data.count mod 2)
+          data:
+            count: { get_param: replica_nodes }
+      resource_def:
+        type: https://raw.githubusercontent.com/binerogroup/heat-templates/main/database/mariadb/mariadb_replica.yaml
+        properties:
+          stack_name: { get_param: OS::stack_name }
+          index: <%index%>
+          flavor: { get_param: db_flavor }
+          sec_groups:
+          - default
+          - get_resource: sg_cluster
+          admin_key: { get_param: admin_key }
+          az: { get_param: alt_az }
+          net: { get_param: alt_net }
+          pri_ip:
+            if:
+            - use_floating_ip
+            - get_attr: [ pri_float_ip, floating_ip_address ]
+            - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+          data_size: { get_param: data_size }
+          repl_pass: { get_attr: [ primary_bootstrap, data ] }
+          multi_site: { if: [ multi_site, true, false ] }
+          primary_site: false
+  volume_backup_job:
+    type: OS::Mistral::CronTrigger
+    condition: do_backup
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-db-backup"
+          data:
+            stack: { get_param: OS::stack_name }
+      pattern: 0 3 * * *
+      workflow:
+        name: create_volume_backup
+        input:
+          volume_id: { get_resource: primary_backup_volume }
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days: { get_param: backup_retention }
+          description:
+            yaql:
+              expression: now().format("%Y-%m-%d %H:%M")
+
+outputs:
+  primary_ip:
+    value:
+      if:
+      - use_floating_ip
+      - get_attr: [ pri_float_ip, floating_ip_address ]
+      - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+    description: IP to primary (read-write) MariaDB node
+  mariadb_port:
+    value: 3306
+    description: MariaDB listen port
+  mariadb_root_password:
+    description: Password for the MariaDB root user
+    value: { get_attr: [ mariadb_root_password, value ] }

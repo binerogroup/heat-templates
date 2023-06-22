@@ -1,0 +1,528 @@
+heat_template_version: wallaby
+description: PostgreSQL 15 cluster using repmgr
+
+parameter_groups:
+- label: General
+  description: General parameters
+  parameters:
+  - admin_key
+  - db_flavor
+  - data_size
+  - replica_nodes
+  - pri_az
+  - pri_net
+  - alt_az
+  - alt_net
+- label: Backup
+  description: Backup options
+  parameters:
+  - backup
+  - backup_volume_size
+  - backup_retention
+
+parameters:
+  admin_key:
+    type: string
+    label: Admin SSH key
+    description: Admin key name (If you see nothing you need to first create a key under SSH-KEY)
+    constraints:
+    - custom_constraint: nova.keypair
+  db_flavor:
+    label: Instance flavor
+    type: string
+    description: Flavor to be used for database instances
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  data_size:
+    label: Estimated database size (in GB)
+    type: number
+    default: 4
+    description: This number is used to calculate the initial root volume size to accommodate PostgreSQL data
+  replica_nodes:
+    type: number
+    label: Replicas
+    description: Number of replica (read-only) database nodes. 0 creates a PostgreSQL instance without replication
+    default: 0
+  pri_az:
+    label: Primary availability zone
+    default: europe-se-1a
+    description: The availability zone for the primary network. Available options are europe-se-1a and europe-se-1b
+    type: string
+  pri_net:
+    label: Primary network
+    type: string
+    description: The network that the primary node (plus every uneven node if cluster) should be attached to
+    default: dummy
+    constraints:
+    - custom_constraint: neutron.network
+  alt_az:
+    label: Alternate availability zone
+    default: europe-se-1b
+    description: Alternate availability zone to launch every second replica node in.
+      Available options are europe-se-1a and europe-se-1b
+    type: string
+  alt_net:
+    constraints:
+    - custom_constraint: neutron.network
+    label: Alternate network
+    type: string
+    default: dummy
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Perform daily backups
+  backup_volume_size:
+    type: number
+    label: Backup volume size (in GB)
+    default: 10
+  backup_retention:
+    label: Backup retention (in days)
+    type: number
+    default: 7
+    description: Days for which backups will be kept
+
+conditions:
+  multi_nodes:
+    not: { equals: [ 0, { get_param: replica_nodes } ] }
+  multi_site:
+    and:
+    - not: { equals: [ 0, { get_param: replica_nodes } ] }
+    - not:
+        equals:
+        - get_param: pri_net
+        - get_param: alt_net
+  use_floating_ip:
+    and:
+    - not: { equals: [ 0, { get_param: replica_nodes } ] }
+    - not:
+        equals:
+        - get_param: pri_net
+        - get_param: alt_net
+    - not:
+        contains:
+        - get_param: pri_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+  sec_group_id_mode:
+    or:
+    - equals: [ 0, { get_param: replica_nodes } ]
+    - equals:
+      - get_param: pri_net
+      - get_param: alt_net
+    - and:
+      - contains:
+        - get_param: pri_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+      - contains:
+        - get_param: alt_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+  do_backup:
+    get_param: backup
+
+resources:
+  sg_cluster:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: [ -, [ { get_param: OS::stack_name }, cluster ] ] }
+      rules:
+        repeat:
+          for_each:
+            <%port%>: [ '22', '5432' ]
+          template:
+            protocol: tcp
+            port_range_min: <%port%>
+            port_range_max: <%port%>
+            remote_mode: { if: [ sec_group_id_mode, remote_group_id, remote_ip_prefix ] }
+  primary_backup_volume:
+    type: OS::Cinder::Volume
+    condition: do_backup
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]+"-db-backup"
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      volume_type: hdd
+      size: { get_param: backup_volume_size }
+      availability_zone: { get_param: pri_az }
+  pri_port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      network: { get_param: pri_net }
+      security_groups:
+      - default
+      - get_resource: sg_cluster
+  pri_float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: use_floating_ip
+    properties:
+      floating_network: { list_join: [ -, [ { str_replace: { template: { get_param: pri_az }, params: { se-1: se-1-1 } } }, net0 ] ] }
+  pri_float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: use_floating_ip
+    properties:
+      floatingip_id: { get_resource: pri_float_ip }
+      port_id: { get_resource: pri_port }
+  postgres_password:
+    type: OS::Heat::RandomString
+    properties:
+      salt:
+        get_param: OS::stack_name
+  config_primary:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        map_merge:
+        - keyboard:
+            layout: se
+          timezone: Europe/Stockholm
+          ssh_pwauth: false
+          disable_root: false
+          manage_etc_hosts: true
+          swap:
+            filename: /swapfile
+            size: 2G
+            maxsize: 2G
+          apt:
+            debconf_selections:
+              unattended-upgrades: unattended-upgrades unattended-upgrades/enable_auto_updates boolean false
+          package_update: true
+          package_upgrade: true
+          package_reboot_if_required: true
+          packages:
+          - console-setup
+          - ncurses-term
+          - screen
+          - tcpdump
+          - net-tools
+          write_files:
+          - path: /etc/apt/apt.conf.d/20auto-upgrades
+            content: |
+              APT::Periodic::Update-Package-Lists "0";
+              APT::Periodic::Unattended-Upgrade "0";
+          - path: /etc/sysctl.d/99-postgres.conf
+            content: |
+              vm.swappiness = 1
+              vm.overcommit_memory = 2
+          - path: /etc/sudoers.d/99-postgres
+            content: |
+              Defaults:postgres       !requiretty
+              postgres        ALL=(root)      NOPASSWD: /bin/systemctl start postgresql, /bin/systemctl stop postgresql, /bin/systemctl restart postgresql, /bin/systemctl reload postgresql, /bin/systemctl start repmgrd, /bin/systemctl stop repmgrd, /bin/systemctl reload repmgrd, /etc/init.d/repmgrd start, /etc/init.d/repmgrd stop, /etc/init.d/repmgrd restart
+            permissions: '0440'
+          - path: /root/default_repmgrd
+            content: |
+              # default settings for repmgrd. This file is source by /bin/sh from
+              # /etc/init.d/repmgrd
+
+              # # disable repmgrd by default so it won't get started upon installation
+              # # valid values: yes/no
+              REPMGRD_ENABLED=no
+
+              # configuration file (required)
+              REPMGRD_CONF="/etc/repmgr.conf"
+
+              # additional options
+              REPMGRD_OPTS="--daemonize=false"
+
+              # user to run repmgrd as
+              #REPMGRD_USER=postgres
+
+              # repmgrd binary
+              #REPMGRD_BIN=/usr/bin/repmgrd
+
+              # pid file
+              #REPMGRD_PIDFILE=/var/run/repmgrd.pid
+          - path: /root/repmgr.conf
+            content:
+              str_replace:
+                template: |
+                  node_id=1
+                  node_name='!HOSTNAME!'
+                  location='!AZ!'
+                  conninfo='host=!IP! user=repmgr dbname=repmgr'
+                  config_directory='/etc/postgresql/15/main'
+                  data_directory='/var/lib/postgresql/15/main'
+
+                  failover='manual'
+                  priority=100
+                  promote_command='/usr/bin/repmgr standby promote --log-to-file --siblings-follow'
+                  follow_command='/usr/bin/repmgr standby follow --log-to-file --upstream-node-id=%n'
+                  connection_check_type='ping'
+                  reconnect_attempts=6
+                  reconnect_interval=10
+
+                  primary_visibility_consensus=true
+                  standby_disconnect_on_failover=true
+
+                  repmgrd_service_start_command='/usr/bin/sudo /bin/systemctl start repmgrd'
+                  repmgrd_service_stop_command='/usr/bin/sudo /bin/systemctl stop repmgrd'
+
+                  service_start_command='/usr/bin/sudo /bin/systemctl start postgresql'
+                  service_stop_command='/usr/bin/sudo /bin/systemctl stop postgresql'
+                  service_restart_command='/usr/bin/sudo /bin/systemctl restart postgresql'
+                  service_reload_command='/usr/bin/sudo /bin/systemctl reload postgresql'
+
+                  ssh_options='-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10'
+
+                  monitoring_history=no
+                  monitor_interval_secs=5
+                  log_file='/var/log/postgresql/repmgrd.log'
+                params:
+                  '!HOSTNAME!':
+                    yaql:
+                      expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]
+                      data:
+                        stack: { get_param: OS::stack_name }
+                        az: { get_param: pri_az }
+                  '!IP!':
+                    if:
+                    - use_floating_ip
+                    - get_attr: [ pri_float_ip, floating_ip_address ]
+                    - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+                  '!AZ!': { get_param: pri_az }
+            permissions: '0640'
+          - path: /etc/cron.daily/rm-init
+            content: |
+              #!/bin/sh -e
+              sed -i '/init$/d' /var/lib/postgresql/.ssh/authorized_keys
+              rm -f /etc/cron.daily/rm-init
+            permissions: '0755'
+          - path: /etc/cron.daily/pgbackup
+            permissions: { if: [ do_backup, '0770', '0660' ] }
+            content: |
+              #!/bin/sh
+              PSQL=/usr/bin/psql
+              PGDUMP=/usr/bin/pg_dump
+              BACKUPDIR=/mnt/backup/auto
+              PGUSER=postgres
+
+              mkdir -p "$BACKUPDIR"
+              chown $PGUSER:$PGUSER "$BACKUPDIR"
+              DBNAMES=`sudo -u $PGUSER psql -l -A -F: | sed -ne "/:/ { /Name:Owner/d; /template0/d; /repmgr/d; s/:.*$//; p }"`
+
+              for db in $DBNAMES; do
+                sudo -u $PGUSER $PGDUMP -cC -N repmgr -f "$BACKUPDIR/$db.sql" "$db"
+              done
+              find "$BACKUPDIR" -mtime +1 -name "*.sql" -delete
+          - path: /root/ssh_config
+            content: |
+              Host *
+                  StrictHostKeyChecking no
+            permissions: '0640'
+          - path: /root/replication.conf
+            content: |
+              listen_addresses = '*'
+              max_wal_senders = 10
+              max_replication_slots = 10
+              wal_level = 'replica'
+              hot_standby = on
+              archive_mode = on
+              archive_command = '/bin/true'
+              wal_log_hints = on
+              shared_preload_libraries = 'repmgr'
+          runcmd:
+          - dpkg-reconfigure -fnoninteractive unattended-upgrades
+          - curl -sfL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          - echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" >/etc/apt/sources.list.d/pgdg.list
+          - apt-get update
+          - apt-get install -y postgresql-15 postgresql-15-repmgr
+          - apt-get autoremove -y
+          - sysctl --system
+          - sed -i '/^XKBLAYOUT=/s/=.*/="se"/' /etc/default/keyboard
+          - setupcon
+          - sed -iE '/daily/s/^[[:digit:]]+\s[[:digit:]]+/30 2/' /etc/crontab
+          - mv /root/default_repmgrd /etc/default/repmgrd
+          - mv /root/repmgr.conf /etc/
+          - mv /root/replication.conf /etc/postgresql/15/main/conf.d/
+          - mkdir -p /var/lib/postgresql/.ssh
+          - mv /root/ssh_config /var/lib/postgresql/.ssh/config
+          - ssh-keygen -q -a 100 -t ed25519 -N '' -C init -f /var/lib/postgresql/.ssh/id_ed25519_init
+          - ssh-keygen -q -a 100 -t ed25519 -N '' -C postgres -f /var/lib/postgresql/.ssh/id_ed25519
+          - cat /var/lib/postgresql/.ssh/*.pub >/var/lib/postgresql/.ssh/authorized_keys
+          - echo "\n\nhost    replication     repmgr          0.0.0.0/0               scram-sha-256" >>/etc/postgresql/15/main/pg_hba.conf
+          - echo 'host    repmgr          repmgr          0.0.0.0/0               scram-sha-256' >>/etc/postgresql/15/main/pg_hba.conf
+          - echo 'host    all             all             0.0.0.0/0               scram-sha-256' >>/etc/postgresql/15/main/pg_hba.conf
+          - str_replace:
+              template: sudo -upostgres psql -c "alter user postgres with password '!PGPASS!';"
+              params: { '!PGPASS!': { get_attr: [ postgres_password, value ] } }
+          - sudo -upostgres createuser -s repmgr
+          - sudo -upostgres createdb repmgr -O repmgr
+          - export PGPASS=`cat /dev/urandom | tr -dc '[:alpha:]' | fold -w ${1:-20} | head -n 1`
+          - sudo -upostgres psql -c "alter user repmgr with password '$PGPASS';"
+          - sudo -upostgres psql -c 'alter user repmgr set search_path to repmgr, "$user", public;'
+          - echo "*:*:repmgr:repmgr:$PGPASS\n*:*:replication:repmgr:$PGPASS" >/var/lib/postgresql/.pgpass
+          - chmod 600 /var/lib/postgresql/.pgpass
+          - chown -R postgres:postgres /var/lib/postgresql /etc/repmgr.conf /etc/postgresql/15/main/conf.d
+          - systemctl restart postgresql@15-main
+          - sudo -upostgres repmgr -f /etc/repmgr.conf primary register
+          - sed -i 's/^REPMGRD_ENABLED=no/REPMGRD_ENABLED=yes/g' /etc/default/repmgrd
+          - systemctl restart repmgrd
+          - list_join: [ ' ', [ { get_attr: [ wait_handle, curl_cli ] }, --data-binary, '"{\"status\": \"SUCCESS\", \"data\": \"`base64 /var/lib/postgresql/.ssh/id_ed25519_init | tr -d \\\n`\"}"' ] ]
+        - if:
+          - do_backup
+          - disk_setup: { /dev/vdb: { table_type: gpt, layout: true } }
+            fs_setup:
+            - label: backupvol
+              filesystem: ext4
+              device: /dev/vdb
+              partition: 1
+            mounts: [ [ LABEL=backupvol, /mnt/backup, ext4, 'defaults,noatime' ] ]
+          - { }
+  primary_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      flavor: { get_param: db_flavor }
+      availability_zone: { get_param: pri_az }
+      key_name: { get_param: admin_key }
+      block_device_mapping_v2:
+        list_concat:
+        - - boot_index: 0
+            delete_on_termination: false
+            image: ubuntu-jammy-22-x86_64
+            volume_size:
+              yaql:
+                expression: int(max(6 + $.data.size, 20))
+                data:
+                  size: { get_param: data_size }
+            disk_bus: virtio
+        - if:
+          - do_backup
+          - - boot_index: -1
+              delete_on_termination: false
+              volume_id: { get_resource: primary_backup_volume }
+              disk_bus: virtio
+          - [ ]
+      networks:
+      - port: { get_resource: pri_port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: config_primary }
+      user_data_update_policy: IGNORE
+  primary_bootstrap:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+  primary_site_replica_nodes:
+    type: OS::Heat::ResourceGroup
+    condition: multi_nodes
+    properties:
+      index_var: <%index%>
+      count:
+        yaql:
+          expression: $.data.count / $.data.divisor
+          data:
+            count: { get_param: replica_nodes }
+            divisor: { if: [ multi_site, 2, 1 ] }
+      resource_def:
+        type: https://raw.githubusercontent.com/binerogroup/heat-templates/main/database/postgres/postgres_replica.yaml
+        properties:
+          stack_name: { get_param: OS::stack_name }
+          index: <%index%>
+          flavor: { get_param: db_flavor }
+          sec_groups:
+          - default
+          - get_resource: sg_cluster
+          admin_key: { get_param: admin_key }
+          az: { get_param: pri_az }
+          net: { get_param: pri_net }
+          pri_ip:
+            if:
+            - use_floating_ip
+            - get_attr: [ pri_float_ip, floating_ip_address ]
+            - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+          data_size: { get_param: data_size }
+          private_key: { get_attr: [ primary_bootstrap, data ] }
+          multi_site: { if: [ multi_site, true, false ] }
+          primary_site: true
+  secondary_site_nodes:
+    type: OS::Heat::ResourceGroup
+    condition: multi_site
+    properties:
+      index_var: <%index%>
+      count:
+        yaql:
+          expression: ($.data.count / 2) + ($.data.count mod 2)
+          data:
+            count: { get_param: replica_nodes }
+      resource_def:
+        type: https://raw.githubusercontent.com/binerogroup/heat-templates/main/database/postgres/postgres_replica.yaml
+        properties:
+          stack_name: { get_param: OS::stack_name }
+          index: <%index%>
+          flavor: { get_param: db_flavor }
+          sec_groups:
+          - default
+          - get_resource: sg_cluster
+          admin_key: { get_param: admin_key }
+          az: { get_param: alt_az }
+          net: { get_param: alt_net }
+          pri_ip:
+            if:
+            - use_floating_ip
+            - get_attr: [ pri_float_ip, floating_ip_address ]
+            - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+          data_size: { get_param: data_size }
+          private_key: { get_attr: [ primary_bootstrap, data ] }
+          multi_site: { if: [ multi_site, true, false ] }
+          primary_site: false
+  volume_backup_job:
+    type: OS::Mistral::CronTrigger
+    condition: do_backup
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-db-backup"
+          data:
+            stack: { get_param: OS::stack_name }
+      pattern: 0 3 * * *
+      workflow:
+        name: create_volume_backup
+        input:
+          volume_id: { get_resource: primary_backup_volume }
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days: { get_param: backup_retention }
+          description:
+            yaql:
+              expression: now().format("%Y-%m-%d %H:%M")
+
+outputs:
+  primary_ip:
+    value:
+      if:
+      - use_floating_ip
+      - get_attr: [ pri_float_ip, floating_ip_address ]
+      - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+    description: IP to primary (read-write) PostgreSQL node
+  postgresql_port:
+    value: 5432
+    description: PostgreSQL listen port
+  postgres_password:
+    description: Password for the PostgreSQL postgres user
+    value: { get_attr: [ postgres_password, value ] }

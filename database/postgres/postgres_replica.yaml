@@ -1,0 +1,270 @@
+heat_template_version: wallaby
+
+parameters:
+  stack_name:
+    type: string
+  index:
+    type: number
+  flavor:
+    type: string
+  sec_groups:
+    type: json
+  admin_key:
+    type: string
+  az:
+    type: string
+  net:
+    type: string
+  pri_ip:
+    type: string
+  data_size:
+    type: number
+  private_key:
+    type: json
+  multi_site:
+    type: string
+  primary_site:
+    type: boolean
+
+conditions:
+  primary_site: { get_param: primary_site }
+  use_floating_ip:
+    and:
+    - equals: [ true, { get_param: multi_site } ]
+    - not:
+        contains:
+        - get_param: net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: stack_name }
+            id: { get_param: index }
+            primary: { get_param: primary_site }
+            az: { get_param: az }
+      network: { get_param: net }
+      security_groups: { get_param: sec_groups }
+  float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: use_floating_ip
+    properties:
+      floating_network: { list_join: [ -, [ { str_replace: { template: { get_param: az }, params: { se-1: se-1-1 } } }, net0 ] ] }
+  float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: use_floating_ip
+    properties:
+        floatingip_id: { get_resource: float_ip }
+        port_id: { get_resource: port }
+  config:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        keyboard:
+          layout: se
+        timezone: Europe/Stockholm
+        ssh_pwauth: false
+        disable_root: false
+        manage_etc_hosts: true
+        swap:
+          filename: /swapfile
+          size: 2G
+          maxsize: 2G
+        apt:
+          debconf_selections:
+            unattended-upgrades: unattended-upgrades unattended-upgrades/enable_auto_updates boolean false
+        package_update: true
+        package_upgrade: true
+        package_reboot_if_required: true
+        packages:
+        - console-setup
+        - ncurses-term
+        - screen
+        - tcpdump
+        - net-tools
+        write_files:
+        - path: /etc/apt/apt.conf.d/20auto-upgrades
+          content: |
+            APT::Periodic::Update-Package-Lists "0";
+            APT::Periodic::Unattended-Upgrade "0";
+        - path: /etc/sysctl.d/99-postgres.conf
+          content: |
+            vm.swappiness = 1
+            vm.overcommit_memory = 2
+        - path: /etc/sudoers.d/99-postgres
+          content: |
+            Defaults:postgres       !requiretty
+            postgres        ALL=(root)      NOPASSWD: /bin/systemctl start postgresql, /bin/systemctl stop postgresql, /bin/systemctl restart postgresql, /bin/systemctl reload postgresql, /bin/systemctl start repmgrd, /bin/systemctl stop repmgrd, /bin/systemctl reload repmgrd, /etc/init.d/repmgrd start, /etc/init.d/repmgrd stop, /etc/init.d/repmgrd restart
+          permissions: '0440'
+        - path: /root/default_repmgrd
+          content: |
+            # default settings for repmgrd. This file is source by /bin/sh from
+            # /etc/init.d/repmgrd
+
+            # # disable repmgrd by default so it won't get started upon installation
+            # # valid values: yes/no
+            REPMGRD_ENABLED=no
+
+            # configuration file (required)
+            REPMGRD_CONF="/etc/repmgr.conf"
+
+            # additional options
+            REPMGRD_OPTS="--daemonize=false"
+
+            # user to run repmgrd as
+            #REPMGRD_USER=postgres
+
+            # repmgrd binary
+            #REPMGRD_BIN=/usr/bin/repmgrd
+
+            # pid file
+            #REPMGRD_PIDFILE=/var/run/repmgrd.pid
+        - path: /root/repmgr.conf
+          content:
+            str_replace:
+              template: |
+                node_id=!NODEID!
+                node_name='!HOSTNAME!'
+                location='!AZ!'
+                conninfo='host=!IP! user=repmgr dbname=repmgr'
+                config_directory='/etc/postgresql/15/main'
+                data_directory='/var/lib/postgresql/15/main'
+
+                failover='manual'
+                priority=!PRIORITY!
+                promote_command='/usr/bin/repmgr standby promote --log-to-file --siblings-follow'
+                follow_command='/usr/bin/repmgr standby follow --log-to-file --upstream-node-id=%n'
+                connection_check_type='ping'
+                reconnect_attempts=6
+                reconnect_interval=10
+
+                primary_visibility_consensus=true
+                standby_disconnect_on_failover=true
+
+                repmgrd_service_start_command='/usr/bin/sudo /bin/systemctl start repmgrd'
+                repmgrd_service_stop_command='/usr/bin/sudo /bin/systemctl stop repmgrd'
+
+                service_start_command='/usr/bin/sudo /bin/systemctl start postgresql'
+                service_stop_command='/usr/bin/sudo /bin/systemctl stop postgresql'
+                service_restart_command='/usr/bin/sudo /bin/systemctl restart postgresql'
+                service_reload_command='/usr/bin/sudo /bin/systemctl reload postgresql'
+
+                ssh_options='-q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10'
+
+                monitoring_history=no
+                monitor_interval_secs=5
+                log_file='/var/log/postgresql/repmgrd.log'
+              params:
+                '!NODEID!':
+                  yaql:
+                    expression: str($.data.id+1+int($.data.primary)+int(not $.data.primary)*40)
+                    data:
+                      id: { get_param: index }
+                      primary: { get_param: primary_site }
+                '!HOSTNAME!':
+                  yaql:
+                    expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]
+                    data:
+                      stack: { get_param: stack_name }
+                      id: { get_param: index }
+                      primary: { get_param: primary_site }
+                      az: { get_param: az }
+                '!IP!':
+                  if:
+                  - use_floating_ip
+                  - get_attr: [ float_ip, floating_ip_address ]
+                  - get_attr: [ port, fixed_ips, 0, ip_address ]
+                '!PRIORITY!':
+                  yaql:
+                    expression: str(40-$.data.id+int($.data.primary)*40)
+                    data:
+                      id: { get_param: index }
+                      primary: { get_param: primary_site }
+                '!AZ!': { get_param: az }
+          permissions: '0640'
+        - path: /root/ssh_config
+          content: |
+            Host *
+                StrictHostKeyChecking no
+          permissions: '0640'
+        runcmd:
+        - dpkg-reconfigure -fnoninteractive unattended-upgrades
+        - apt-get autoremove -y
+        - curl -sfL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+        - echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt jammy-pgdg main" >/etc/apt/sources.list.d/pgdg.list
+        - apt-get update
+        - apt-get install -y postgresql-15 postgresql-15-repmgr
+        - sysctl --system
+        - sed -i '/^XKBLAYOUT=/s/=.*/="se"/' /etc/default/keyboard
+        - setupcon
+        - mv /root/default_repmgrd /etc/default/repmgrd
+        - mv /root/repmgr.conf /etc/repmgr.conf
+        - mkdir -p /var/lib/postgresql/.ssh
+        - mv /root/ssh_config /var/lib/postgresql/.ssh/config
+        - str_replace:
+            template: echo 'KEY' | base64 -d >/var/lib/postgresql/.ssh/id_ed25519
+            params: { KEY: { get_param: [ private_key, '1' ] } }
+        - chmod 600 /var/lib/postgresql/.ssh/id_ed25519
+        - chown -R postgres:postgres /var/lib/postgresql/.ssh
+        - str_replace:
+            template: sudo -upostgres scp -p postgres@IP:.ssh/* /var/lib/postgresql/.ssh/
+            params: { IP: { get_param: pri_ip } }
+        - str_replace:
+            template:  sudo -upostgres scp -p postgres@IP:.pgpass /var/lib/postgresql/
+            params: { IP: { get_param: pri_ip } }
+        - sed -i '/init$/d' /var/lib/postgresql/.ssh/authorized_keys
+        - chown -R postgres:postgres /var/lib/postgresql /etc/repmgr.conf /etc/postgresql/15/main/conf.d/
+        - systemctl stop postgresql@15-main
+        - list_join: [ ' ', [ sleep, { yaql: { expression: str(60*$.data.id+int($.data.primary)*30), data: { id: { get_param: index }, primary: { get_param: primary_site } } } } ] ]
+        - str_replace:
+            template: sudo -upostgres repmgr -h IP -U repmgr -d repmgr standby clone -Fc --copy-external-config-files
+            params: { IP: { get_param: pri_ip } }
+        - systemctl start postgresql@15-main
+        - sudo -upostgres repmgr standby register --upstream-node-id=1
+        - sed -i 's/^REPMGRD_ENABLED=no/REPMGRD_ENABLED=yes/g' /etc/default/repmgrd
+        - systemctl restart repmgrd
+        - list_join: [ ' ', [ { get_attr: [ wait_handle, curl_cli ] }, --data-binary, '''{"status": "SUCCESS"}''' ] ]
+  db_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: stack_name }
+            id: { get_param: index }
+            primary: { get_param: primary_site }
+            az: { get_param: az }
+      flavor: { get_param: flavor }
+      availability_zone: { get_param: az }
+      key_name: { get_param: admin_key }
+      block_device_mapping_v2:
+      - boot_index: 0
+        delete_on_termination: false
+        image: ubuntu-jammy-22-x86_64
+        volume_size:
+          yaql:
+            expression: int(max(6 + $.data.size, 20))
+            data:
+              size: { get_param: data_size }
+        disk_bus: virtio
+      networks:
+      - port: { get_resource: port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: config }
+      user_data_update_policy: IGNORE
+  bootstrap:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
