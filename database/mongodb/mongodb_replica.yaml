@@ -1,0 +1,235 @@
+heat_template_version: wallaby
+
+parameters:
+  stack_name:
+    type: string
+  index:
+    type: number
+  flavor:
+    type: string
+  sec_groups:
+    type: json
+  admin_key:
+    type: string
+  az:
+    type: string
+  net:
+    type: string
+  pri_ip:
+    type: string
+  data_size:
+    type: number
+  private_key:
+    type: json
+  multi_site:
+    type: string
+  primary_site:
+    type: boolean
+  backup:
+    type: boolean
+
+conditions:
+  primary_site: { get_param: primary_site }
+  use_floating_ip:
+    and:
+    - equals: [ true, { get_param: multi_site } ]
+    - not:
+        contains:
+        - get_param: net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+
+resources:
+  port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: stack_name }
+            id: { get_param: index }
+            primary: { get_param: primary_site }
+            az: { get_param: az }
+      network: { get_param: net }
+      security_groups: { get_param: sec_groups }
+  float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: use_floating_ip
+    properties:
+      floating_network: { list_join: [ -, [ { str_replace: { template: { get_param: az }, params: { se-1: se-1-1 } } }, net0 ] ] }
+  float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: use_floating_ip
+    properties:
+        floatingip_id: { get_resource: float_ip }
+        port_id: { get_resource: port }
+  data_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]+"-db-vol"
+          data:
+            stack: { get_param: stack_name }
+            id: { get_param: index }
+            primary: { get_param: primary_site }
+            az: { get_param: az }
+      volume_type: ssd
+      size: { get_param: data_size }
+      availability_zone: { get_param: az }
+  config:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_upgrade: true
+        packages:
+        - console-setup
+        - ncurses-term
+        - screen
+        - tcpdump
+        - net-tools
+        package_update: true
+        package_reboot_if_required: true
+        keyboard:
+          layout: se
+        timezone: Europe/Stockholm
+        ssh_pwauth: false
+        disable_root: false
+        manage_etc_hosts: false
+        disk_setup:
+          /dev/vdb:
+            table_type: gpt
+            layout: true
+        fs_setup:
+        - label: dbvol
+          filesystem: xfs
+          device: /dev/vdb
+          partition: 1
+        mounts:
+        - [ "LABEL=dbvol", /var/lib/mongodb, xfs, "defaults,noatime" ]
+        swap:
+          filename: /swapfile
+          size: 2G
+          maxsize: 2G
+        apt:
+          debconf_selections:
+            unattended_upgrades: unattended-upgrades unattended-upgrades/enable_auto_updates boolean false
+        write_files:
+        - path: /etc/apt/apt.conf.d/20auto-upgrades
+          content: |
+            APT::Periodic::Update-Package-Lists "0";
+            APT::Periodic::Unattended-Upgrade "0";
+        - path: /etc/sysctl.d/99-mongodb.conf
+          content: |
+            kernel.threads-max = 64000
+            vm.swappiness = 1
+            vm.max_map_count = 128000
+            net.ipv4.tcp_keepalive_time = 120
+        - path: /etc/rc.local
+          permissions: '0755'
+          content: |
+            #!/bin/sh
+            blockdev --setra 8 /dev/vdb
+            echo "none" | tee /sys/block/vdb/queue/scheduler
+        - path: /etc/logrotate.d/mongo
+          content: |
+            /var/log/mongodb/mongod.log
+            /var/log/mongodb/mongos.log
+            {
+              rotate 7
+              daily
+              missingok
+              notifempty
+              delaycompress
+              compress
+              postrotate
+                /usr/bin/killall -SIGUSR1 mongod mongos
+              endscript
+            }
+        runcmd:
+        - /etc/rc.local
+        - sysctl --system
+        - sed -i '/^XKBLAYOUT=/s/=.*/="se"/' /etc/default/keyboard
+        - setupcon
+        - dpkg-reconfigure -fnoninteractive unattended-upgrades
+        - apt-get autoremove -y
+        - curl -O --output-dir /tmp https://repo.percona.com/apt/percona-release_latest.generic_all.deb
+        - dpkg -i /tmp/percona-release_latest.generic_all.deb
+        - rm -f /tmp/percona-release_latest.generic_all.deb
+        - apt-get update
+        - percona-release setup pdmdb-6.0
+        - apt-get install -y percona-server-mongodb percona-server-mongodb-mongos percona-backup-mongodb
+        - systemctl stop mongod
+        - rm -rf /var/lib/mongodb/*
+        - str_replace:
+            template: echo 'KEY' | base64 -d >/root/.ssh/id_ed25519
+            params: { KEY: { get_param: [ private_key, '1' ] } }
+        - chmod 600 /root/.ssh/id_ed25519
+        - str_replace:
+            template: |
+              scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p PRIMARY:/var/lib/mongodb/.keyFile /var/lib/mongodb
+              scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p PRIMARY:/etc/mongod.conf /etc
+              scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p PRIMARY:/etc/default/pbm-agent /etc/default
+              scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -p PRIMARY:/root/.bash* /root
+              rm /root/.ssh/id_ed25519
+              . /root/.bashrc
+              chown -R mongod:mongod /var/lib/mongodb
+              systemctl restart mongod
+              bash -ic "echo 'rs.add({host: \"HOST:27017\"})' | mongosh --host PRIMARY"
+              sleep 10
+              test BACKUP = True && systemctl enable pbm-agent && systemctl start pbm-agent
+            params:
+              PRIMARY: { get_param: pri_ip }
+              HOST: { if: [ use_floating_ip, { get_attr: [ float_ip, floating_ip_address ] }, { get_attr: [ port, fixed_ips, 0, ip_address ] } ] }
+              BACKUP: { get_param: backup }
+        - list_join: [ ' ', [ { get_attr: [ wait_handle, curl_cli ] }, --data-binary, '''{"status": "SUCCESS"}''' ] ]
+  db_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-"+str($.data.id+1+int($.data.primary))+"-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: stack_name }
+            id: { get_param: index }
+            primary: { get_param: primary_site }
+            az: { get_param: az }
+      flavor: { get_param: flavor }
+      availability_zone: { get_param: az }
+      key_name: { get_param: admin_key }
+      block_device_mapping_v2:
+      - boot_index: 0
+        delete_on_termination: false
+        image: ubuntu-jammy-22-x86_64
+        volume_size: 20
+        disk_bus: virtio
+      - boot_index: -1
+        delete_on_termination: false
+        volume_id: { get_resource: data_volume }
+        disk_bus: virtio
+      networks:
+      - port: { get_resource: port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: config }
+      user_data_update_policy: IGNORE
+  bootstrap:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+
+outputs:
+  name:
+    value:
+      get_attr: [ db_instance, name ]
+  ip:
+    value:
+      if:
+      - use_floating_ip
+      - get_attr: [ float_ip, floating_ip_address ]
+      - get_attr: [ port, fixed_ips, 0, ip_address ]

@@ -1,0 +1,529 @@
+heat_template_version: wallaby
+description: Percona Server for MongoDB 6.0 cluster on Ubuntu 22.04
+
+parameter_groups:
+- label: General
+  description: General parameters
+  parameters:
+  - admin_key
+  - db_flavor
+  - data_size
+  - replica_nodes
+  - pri_az
+  - pri_net
+  - alt_az
+  - alt_net
+- label: Backup
+  description: Backup options
+  parameters:
+  - backup
+  - ec2_access
+  - ec2_secret
+  - s3_endpoint
+  - s3_region
+  - s3_bucket
+  - backup_retention
+
+parameters:
+  admin_key:
+    type: string
+    label: Admin SSH key
+    description: Admin key name (If you see nothing you need to first create a key under SSH-KEY)
+    constraints:
+    - custom_constraint: nova.keypair
+  db_flavor:
+    label: Instance flavor
+    type: string
+    description: Flavor to be used for database instances
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+  data_size:
+    label: Database volume size (in GB)
+    type: number
+    default: 4
+    description: Specify a size for the MongoDB data volume
+  replica_nodes:
+    type: number
+    label: Nodes
+    description: Number of database nodes (use an odd number up to a maximum of 7)
+    default: 1
+    constraints:
+    - range: { min: 1, max: 7 }
+    - modulo: { step: 2, offset: 1 }
+  pri_az:
+    label: Primary availability zone
+    default: europe-se-1a
+    description: The availability zone for the primary network. Available options are europe-se-1a and europe-se-1b
+    type: string
+  pri_net:
+    label: Primary network
+    type: string
+    description: The network that every uneven N node should be attached to
+    default: dummy
+    constraints:
+    - custom_constraint: neutron.network
+  alt_az:
+    label: Alternate availability zone
+    default: europe-se-1b
+    description: Alternate availability zone to launch every even N node in. Available options are europe-se-1a and europe-se-1b
+    type: string
+  alt_net:
+    constraints:
+    - custom_constraint: neutron.network
+    label: Alternate network
+    type: string
+    default: dummy
+  backup:
+    label: Backup
+    type: boolean
+    default: false
+    description: Perform daily backups
+  ec2_access:
+    label: EC2 access ID
+    type: string
+    description: The EC2 access ID for S3 access
+    default: ""
+  ec2_secret:
+    label: EC2 secret key
+    type: string
+    hidden: true
+    description: The EC2 secret key for S3 access
+    default: ""
+  s3_endpoint:
+    label: S3 endpoint URL
+    type: string
+    default: https://object-eu-se-1a.binero.cloud
+    description: S3 endpoint URL for backup storage
+  s3_region:
+    label: S3 region
+    type: string
+    default: europe-se-1
+    description: S3 region for backup storage (typically does not need to be changed)
+  s3_bucket:
+    label: S3 bucket name
+    type: string
+    description: Name of the S3 bucket containing backups
+    default: ""
+  backup_retention:
+    label: Backup retention (in days)
+    type: number
+    default: 7
+    description: Days during which backups will be kept (minimum 7 days)
+    constraints:
+    - range: { min: 7 }
+
+
+conditions:
+  multi_nodes:
+    not: { equals: [ 1, { get_param: replica_nodes } ] }
+  multi_site:
+    and:
+    - not: { equals: [ 1, { get_param: replica_nodes } ] }
+    - not:
+        equals:
+        - get_param: pri_net
+        - get_param: alt_net
+  use_floating_ip:
+    and:
+    - not: { equals: [ 1, { get_param: replica_nodes } ] }
+    - not:
+        equals:
+        - get_param: pri_net
+        - get_param: alt_net
+    - not:
+        contains:
+        - get_param: pri_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+  sec_group_id_mode:
+    or:
+    - equals: [ 1, { get_param: replica_nodes } ]
+    - equals:
+      - get_param: pri_net
+      - get_param: alt_net
+    - and:
+      - contains:
+        - get_param: pri_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+      - contains:
+        - get_param: alt_net
+        - - europe-se-1-1a-net0
+          - 35164b56-13a1-4b06-b0e7-94c9a67fef7e
+          - europe-se-1-1b-net0
+          - b704a204-6f05-47fb-9fa0-987586dd8c5a
+  do_backup:
+    get_param: backup
+
+resources:
+  sg_cluster:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: [ -, [ { get_param: OS::stack_name }, cluster ] ] }
+      rules:
+        repeat:
+          for_each:
+            <%port%>: [ '22', '27017' ]
+          template:
+            protocol: tcp
+            port_range_min: <%port%>
+            port_range_max: <%port%>
+            remote_mode: { if: [ sec_group_id_mode, remote_group_id, remote_ip_prefix ] }
+  pri_port:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      network: { get_param: pri_net }
+      security_groups:
+      - default
+      - get_resource: sg_cluster
+  pri_float_ip:
+    type: OS::Neutron::FloatingIP
+    condition: use_floating_ip
+    properties:
+      floating_network: { list_join: [ -, [ { str_replace: { template: { get_param: pri_az }, params: { se-1: se-1-1 } } }, net0 ] ] }
+  pri_float_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    condition: use_floating_ip
+    properties:
+      floatingip_id: { get_resource: pri_float_ip }
+      port_id: { get_resource: pri_port }
+  primary_data_volume:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]+"-db-vol"
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      volume_type: ssd
+      size: { get_param: data_size }
+      availability_zone: { get_param: pri_az }
+  mongo_root_password:
+    type: OS::Heat::RandomString
+    properties:
+      salt:
+        get_param: OS::stack_name
+  config_primary:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_upgrade: true
+        packages:
+        - console-setup
+        - ncurses-term
+        - screen
+        - tcpdump
+        - net-tools
+        package_update: true
+        package_reboot_if_required: true
+        keyboard:
+          layout: se
+        timezone: Europe/Stockholm
+        ssh_pwauth: false
+        disable_root: false
+        manage_etc_hosts: false
+        disk_setup:
+          /dev/vdb:
+            table_type: gpt
+            layout: true
+        fs_setup:
+        - label: dbvol
+          filesystem: xfs
+          device: /dev/vdb
+          partition: 1
+        mounts:
+        - [ "LABEL=dbvol", /var/lib/mongodb, xfs, "defaults,noatime" ]
+        swap:
+          filename: /swapfile
+          size: 2G
+          maxsize: 2G
+        apt:
+          debconf_selections:
+            unattended_upgrades: unattended-upgrades unattended-upgrades/enable_auto_updates boolean false
+        write_files:
+          list_concat:
+          - - path: /etc/apt/apt.conf.d/20auto-upgrades
+              content: |
+                APT::Periodic::Update-Package-Lists "0";
+                APT::Periodic::Unattended-Upgrade "0";
+            - path: /etc/sysctl.d/99-mongodb.conf
+              content: |
+                kernel.threads-max = 64000
+                vm.swappiness = 1
+                vm.max_map_count = 128000
+                net.ipv4.tcp_keepalive_time = 120
+            - path: /etc/rc.local
+              permissions: '0755'
+              content: |
+                #!/bin/sh
+                blockdev --setra 8 /dev/vdb
+                echo "none" | tee /sys/block/vdb/queue/scheduler
+            - path: /etc/logrotate.d/mongo
+              content: |
+                /var/log/mongodb/mongod.log
+                /var/log/mongodb/mongos.log
+                {
+                  rotate 7
+                  daily
+                  missingok
+                  notifempty
+                  delaycompress
+                  compress
+                  postrotate
+                    /usr/bin/killall -SIGUSR1 mongod mongos
+                  endscript
+                }
+            - path: /etc/cron.d/pbm
+              permissions: '0644'
+              content: |
+                # Base backup on Sundays
+                30 2 * * 0 mongod test -f /var/lib/mongodb/.backuprc && ( . /var/lib/mongodb/.backuprc; /usr/bin/pbm backup -t incremental --base -w; /usr/bin/pbm cleanup -y --older-than "$RETENTION" -w )
+                # Daily incremental during the rest of the week
+                30 2 * * 1-6 mongod test -f /var/lib/mongodb/.backuprc && ( . /var/lib/mongodb/.backuprc; /usr/bin/pbm backup -t incremental -w; /usr/bin/pbm cleanup -y --older-than "$RETENTION" -w )
+            - path: /etc/cron.daily/rm-init
+              content: |
+                #!/bin/sh -e
+                sed -i '/init$/d' /root/.ssh/authorized_keys
+                rm -f /root/.ssh/id_ed25519_init* /etc/cron.daily/rm-init
+              permissions: '0750'
+          - if:
+            - do_backup
+            - - path: /root/pbm.conf
+                permissions: '0640'
+                content:
+                  str_replace:
+                    template: |
+                      storage:
+                        type: s3
+                        s3:
+                          endpointUrl: "ENDPOINT"
+                          region: REGION
+                          bucket: BUCKET
+                          prefix: pbm/STACK
+                          credentials:
+                            access-key-id: ACCESS
+                            secret-access-key: SECRET
+                    params:
+                      STACK: { get_param: OS::stack_name }
+                      ENDPOINT: { get_param: s3_endpoint }
+                      REGION: { get_param: s3_region }
+                      BUCKET: { get_param: s3_bucket }
+                      ACCESS: { get_param: ec2_access }
+                      SECRET: { get_param: ec2_secret }
+            - [ ]
+        runcmd:
+        - /etc/rc.local
+        - sysctl --system
+        - sed -i '/^XKBLAYOUT=/s/=.*/="se"/' /etc/default/keyboard
+        - setupcon
+        - dpkg-reconfigure -fnoninteractive unattended-upgrades
+        - apt-get autoremove -y
+        - curl -O --output-dir /tmp https://repo.percona.com/apt/percona-release_latest.generic_all.deb
+        - dpkg -i /tmp/percona-release_latest.generic_all.deb
+        - rm -f /tmp/percona-release_latest.generic_all.deb
+        - apt-get update
+        - percona-release setup pdmdb-6.0
+        - apt-get install -y percona-server-mongodb percona-server-mongodb-mongos percona-backup-mongodb
+        - openssl rand -base64 756 >/var/lib/mongodb/.keyFile
+        - chmod 400 /var/lib/mongodb/.keyFile
+        - chown -R mongod:mongod /var/lib/mongodb
+        - export PBM_PASS=`openssl rand -hex 24`
+        - str_replace:
+            template: |
+              echo "use admin
+              db.createUser({user: \"root\", pwd: \"!PASS!\", roles: [\"root\"]})
+              db.createRole({\"role\": \"pbmAnyAction\",
+                privileges: [ { \"resource\": {\"anyResource\": true }, \"actions\": [ \"anyAction\" ] } ],
+                \"roles\": []
+              })
+              db.createUser({user: \"pbm\",
+                \"pwd\": \"$PBM_PASS\",
+                \"roles\": [
+                  {\"db\": \"admin\", \"role\": \"readWrite\", \"collection\": \"\" },
+                  {\"db\": \"admin\", \"role\": \"backup\" },
+                  {\"db\": \"admin\", \"role\": \"clusterMonitor\" },
+                  {\"db\": \"admin\", \"role\": \"restore\" },
+                  {\"db\": \"admin\", \"role\": \"pbmAnyAction\" }
+                ]
+              })" | mongosh
+            params:
+              '!PASS!': { get_attr: [ mongo_root_password, value ] }
+        - sed -i '/bindIp:/s/127\.0\.0\.1/0.0.0.0/' /etc/mongod.conf
+        - |
+          echo '
+          security:
+            keyFile: /var/lib/mongodb/.keyFile
+            authorization: enabled
+
+          replication:
+            replSetName: "rs0"' >>/etc/mongod.conf
+        - systemctl restart mongod
+        - str_replace:
+            template: |
+              echo 'rs.initiate({ _id: "rs0", members: [ { _id: 0, host: "!HOST!:27017" } ] })' | mongosh -u root -p '!PASS!'
+            params:
+              '!HOST!': { if: [ use_floating_ip, { get_attr: [ pri_float_ip, floating_ip_address ] }, { get_attr: [ pri_port, fixed_ips, 0, ip_address ] } ] }
+              '!PASS!': { get_attr: [ mongo_root_password, value ] }
+        - export PBM_MONGODB_URI="mongodb://pbm:$PBM_PASS@localhost:27017/?authSource=admin&replicaSet=rs0"
+        - chmod 640 /etc/default/pbm-agent
+        - echo PBM_MONGODB_URI=\"$PBM_MONGODB_URI\" >/etc/default/pbm-agent
+        - echo export PBM_MONGODB_URI=\"$PBM_MONGODB_URI\" >>/root/.bashrc
+        - str_replace:
+            template: echo "alias mongosh='mongosh -u root -p PASS'" >>/root/.bash_aliases
+            params:
+              'PASS': { get_attr: [ mongo_root_password, value ] }
+        - str_replace:
+            template: |
+              test -f /root/pbm.conf && (
+                echo "export PBM_MONGODB_URI=\"$PBM_MONGODB_URI\"\nexport RETENTION=\"!RETENTION!d\"" >/var/lib/mongodb/.backuprc &&
+                chown mongod:mongod /var/lib/mongodb/.backuprc &&
+                pbm config --file /root/pbm.conf &&
+                rm /root/pbm.conf &&
+                systemctl enable pbm-agent &&
+                systemctl start pbm-agent &&
+                sleep 10 &&
+                pbm backup -t incremental --base
+              )
+            params:
+              '!RETENTION!': { get_param: backup_retention }
+        - ssh-keygen -q -a 100 -t ed25519 -N '' -C init -f /root/.ssh/id_ed25519_init
+        - cat /root/.ssh/id_ed25519_init.pub >>/root/.ssh/authorized_keys
+        - list_join: [ ' ', [ { get_attr: [ wait_handle, curl_cli ] }, --data-binary, '"{\"status\": \"SUCCESS\", \"data\": \"`base64 /root/.ssh/id_ed25519_init | tr -d \\\n`\"}"' ] ]
+  primary_instance:
+    type: OS::Nova::Server
+    properties:
+      name:
+        yaql:
+          expression: $.data.stack+"-1-"+$.data.az.split("-", 1)[1]
+          data:
+            stack: { get_param: OS::stack_name }
+            az: { get_param: pri_az }
+      flavor: { get_param: db_flavor }
+      availability_zone: { get_param: pri_az }
+      key_name: { get_param: admin_key }
+      block_device_mapping_v2:
+      - boot_index: 0
+        delete_on_termination: false
+        image: ubuntu-jammy-22-x86_64
+        volume_size: 20
+        disk_bus: virtio
+      - boot_index: -1
+        delete_on_termination: false
+        volume_id: { get_resource: primary_data_volume }
+        disk_bus: virtio
+      networks:
+      - port: { get_resource: pri_port }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: config_primary }
+      user_data_update_policy: IGNORE
+  primary_bootstrap:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle }
+      timeout: 600
+  wait_handle:
+    type: OS::Heat::WaitConditionHandle
+  primary_site_replica_nodes:
+    type: OS::Heat::ResourceGroup
+    condition: multi_nodes
+    properties:
+      index_var: <%index%>
+      count:
+        yaql:
+          expression: ($.data.count - 1) / $.data.divisor
+          data:
+            count: { get_param: replica_nodes }
+            divisor: { if: [ multi_site, 2, 1 ] }
+      resource_def:
+        type: https://raw.githubusercontent.com/binerogroup/heat-templates/main/database/mongodb/mongodb_replica.yaml
+        properties:
+          stack_name: { get_param: OS::stack_name }
+          index: <%index%>
+          flavor: { get_param: db_flavor }
+          sec_groups:
+          - default
+          - get_resource: sg_cluster
+          admin_key: { get_param: admin_key }
+          az: { get_param: pri_az }
+          net: { get_param: pri_net }
+          pri_ip:
+            if:
+            - use_floating_ip
+            - get_attr: [ pri_float_ip, floating_ip_address ]
+            - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+          data_size: { get_param: data_size }
+          private_key: { get_attr: [ primary_bootstrap, data ] }
+          multi_site: { if: [ multi_site, true, false ] }
+          primary_site: true
+          backup: { get_param: backup }
+  secondary_site_nodes:
+    type: OS::Heat::ResourceGroup
+    condition: multi_site
+    properties:
+      index_var: <%index%>
+      count:
+        yaql:
+          expression: (($.data.count - 1) / 2) + (($.data.count - 1) mod 2)
+          data:
+            count: { get_param: replica_nodes }
+      resource_def:
+        type: https://raw.githubusercontent.com/binerogroup/heat-templates/main/database/mongodb/mongodb_replica.yaml
+        properties:
+          stack_name: { get_param: OS::stack_name }
+          index: <%index%>
+          flavor: { get_param: db_flavor }
+          sec_groups:
+          - default
+          - get_resource: sg_cluster
+          admin_key: { get_param: admin_key }
+          az: { get_param: alt_az }
+          net: { get_param: alt_net }
+          pri_ip:
+            if:
+            - use_floating_ip
+            - get_attr: [ pri_float_ip, floating_ip_address ]
+            - get_attr: [ pri_port, fixed_ips, 0, ip_address ]
+          data_size: { get_param: data_size }
+          private_key: { get_attr: [ primary_bootstrap, data ] }
+          multi_site: { if: [ multi_site, true, false ] }
+          primary_site: false
+          backup: { get_param: backup }
+
+outputs:
+  rs_conn_string:
+    description: Connection string for replica set
+    value:
+      list_join:
+      - '/'
+      - - 'mongodb:/'
+        - list_join:
+          - ','
+          - list_concat:
+            - if:
+              - use_floating_ip
+              - [ get_attr: [ pri_float_ip, floating_ip_address ] ]
+              - [ get_attr: [ pri_port, fixed_ips, 0, ip_address ] ]
+            - if:
+              - multi_nodes
+              - get_attr: [ primary_site_replica_nodes, ip ]
+              - [ ]
+            - if:
+              - multi_site
+              - get_attr: [ secondary_site_nodes, ip ]
+              - [ ]
+        - '?replicaSet=rs0'
+  mongo_root_password:
+    description: Password for the MongoDB root user
+    value: { get_attr: [ mongo_root_password, value ] }
