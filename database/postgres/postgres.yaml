@@ -510,7 +510,9 @@ resources:
           delete_backups_whose_age_more_than_or_equal_days: { get_param: backup_retention }
           description:
             yaql:
-              expression: now().format("%Y-%m-%d %H:%M")
+              expression: $.data.stack+"-db-backup"
+              data:
+                stack: { get_param: OS::stack_name }
 
 outputs:
   primary_ip:
