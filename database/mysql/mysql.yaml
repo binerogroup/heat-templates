@@ -145,6 +145,7 @@ resources:
             port_range_min: <%port%>
             port_range_max: <%port%>
             remote_mode: { if: [ sec_group_id_mode, remote_group_id, remote_ip_prefix ] }
+  primary_backup_volume:
     type: OS::Cinder::Volume
     condition: do_backup
     properties:
