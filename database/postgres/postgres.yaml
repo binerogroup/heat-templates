@@ -41,9 +41,11 @@ parameters:
     description: This number is used to calculate the initial root volume size to accommodate PostgreSQL data
   replica_nodes:
     type: number
-    label: Replicas
-    description: Number of replica (read-only) database nodes. 0 creates a PostgreSQL instance without replication
-    default: 0
+    label: Nodes
+    description: Number of database nodes. 1 creates a PostgreSQL instance without replication
+    default: 1
+    constraints:
+    - range: { min: 1 }
   pri_az:
     label: Primary availability zone
     default: europe-se-1a
@@ -85,17 +87,17 @@ parameters:
 
 conditions:
   multi_nodes:
-    not: { equals: [ 0, { get_param: replica_nodes } ] }
+    not: { equals: [ 1, { get_param: replica_nodes } ] }
   multi_site:
     and:
-    - not: { equals: [ 0, { get_param: replica_nodes } ] }
+    - not: { equals: [ 1, { get_param: replica_nodes } ] }
     - not:
         equals:
         - get_param: pri_net
         - get_param: alt_net
   use_floating_ip:
     and:
-    - not: { equals: [ 0, { get_param: replica_nodes } ] }
+    - not: { equals: [ 1, { get_param: replica_nodes } ] }
     - not:
         equals:
         - get_param: pri_net
@@ -109,7 +111,7 @@ conditions:
           - b704a204-6f05-47fb-9fa0-987586dd8c5a
   sec_group_id_mode:
     or:
-    - equals: [ 0, { get_param: replica_nodes } ]
+    - equals: [ 1, { get_param: replica_nodes } ]
     - equals:
       - get_param: pri_net
       - get_param: alt_net
@@ -434,7 +436,7 @@ resources:
       index_var: <%index%>
       count:
         yaql:
-          expression: $.data.count / $.data.divisor
+          expression: ($.data.count - 1) / $.data.divisor
           data:
             count: { get_param: replica_nodes }
             divisor: { if: [ multi_site, 2, 1 ] }
@@ -466,7 +468,7 @@ resources:
       index_var: <%index%>
       count:
         yaql:
-          expression: ($.data.count / 2) + ($.data.count mod 2)
+          expression: (($.data.count - 1) / 2) + (($.data.count - 1) mod 2)
           data:
             count: { get_param: replica_nodes }
       resource_def:
