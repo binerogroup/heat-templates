@@ -133,7 +133,18 @@ resources:
               '!PRIMARY_IP!': { get_param: pri_ip }
               '!REPL_PASS!': { get_param: [ repl_pass, '1' ] }
         - list_join: [ ' ', [ { get_attr: [ wait_handle, curl_cli ] }, --data-binary, '''{"status": "SUCCESS"}''' ] ]
+  db_volume:
+    type: OS::Cinder::Volume
+    properties:
+      image: ubuntu-jammy-22-x86_64
+      availability_zone: { get_param: az }
+      size:
+        yaql:
+          expression: int(max(6 + $.data.size, 20))
+          data:
+            size: { get_param: data_size }
   db_instance:
+    depends_on: db_volume
     type: OS::Nova::Server
     properties:
       name:
@@ -150,12 +161,7 @@ resources:
       block_device_mapping_v2:
       - boot_index: 0
         delete_on_termination: false
-        image: ubuntu-jammy-22-x86_64
-        volume_size:
-          yaql:
-            expression: int(max(6 + $.data.size, 20))
-            data:
-              size: { get_param: data_size }
+        volume_id: { get_resource: db_volume }
         disk_bus: virtio
       networks:
       - port: { get_resource: port }
@@ -166,6 +172,6 @@ resources:
     type: OS::Heat::WaitCondition
     properties:
       handle: { get_resource: wait_handle }
-      timeout: 600
+      timeout: 1200
   wait_handle:
     type: OS::Heat::WaitConditionHandle
