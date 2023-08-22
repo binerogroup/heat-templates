@@ -1,0 +1,452 @@
+heat_template_version: wallaby
+description: |
+  OpenStack Heat template for deploying the ELK Stack.
+  This template provisions resources including Elasticsearch, Logstash, and Kibana servers,
+  along with necessary security groups, ports, and configurations.
+
+parameters:
+  key:
+    type: string
+    description: Key pair name (If you see nothing you need to first create a key
+      under SSH-KEY)
+    constraints:
+    - custom_constraint: nova.keypair
+  local_net:
+    label: Local network
+    type: string
+    description: The local network you want the server to be attached on (If you see
+      nothing you need to first create a local netowrok)
+    default: local
+    constraints:
+    - custom_constraint: neutron.network
+  elasticsearch_flavor:
+    label: Elasticsearch flavor
+    type: string
+    description: Flavor to be used for the Elasticsearch instance (It is advisable to
+      use a flavor which has minimum 16GB of RAM)
+    default: gp.8x16
+    constraints:
+      - custom_constraint: nova.flavor
+  logstash_flavor:
+    label: Logstash flavor
+    type: string
+    description: Flavor to be used for the Logstash instance
+    default: gp.4x8
+    constraints:
+      - custom_constraint: nova.flavor
+  kibana_flavor:
+    label: Kibana flavor
+    type: string
+    description: Flavor to be used for the Kibana instance
+    default: gp.4x8
+    constraints:
+      - custom_constraint: nova.flavor
+  availability_zone:
+    label: Availability zone
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b
+    type: string
+  elasticsearch_volume_size:
+    type: number
+    default: 30
+    description: Size of the volume for Elasticsearch in GB
+    constraints:
+      - range: { min: 1 }
+  # Backup parameters
+  backup_enabled:
+    type: boolean
+    default: false
+    description: Enable or disable backups for Elasticsearch
+  backup_days:
+    type: number
+    default: 10
+    description: Days backup will be saved before deleted
+
+conditions:
+  backup_elasticsearch:
+    equals:
+    - get_param: backup_enabled
+    - true
+
+resources:
+  # Elasticsearch
+  wait_handle_url_check:
+    type: OS::Heat::WaitConditionHandle
+
+  wait_condition_url_check:
+    type: OS::Heat::WaitCondition
+    properties:
+      handle: { get_resource: wait_handle_url_check }
+      timeout: 600  # Adjust timeout as needed (in seconds)
+
+  port_elasticsearch:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+        - 'bin-elasticsearch'
+        - 'bin-ssh'
+
+  elasticsearchserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - elasticsearch
+      flavor: { get_param: elasticsearch_flavor }
+      networks:
+        - port: { get_resource: port_elasticsearch }
+      key_name: { get_param: key }
+      block_device_mapping:
+        - device_name: vda
+          delete_on_termination: false 
+          volume_id: { get_resource: root_volume_elasticsearch }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: elasticsearch_userdata }
+
+  elasticsearch_userdata:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: false
+        packages:
+          - openjdk-11-jre-headless
+          - wget
+          - curl
+          - software-properties-common
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        write_files:
+        - path: /var/lib/cloud/scripts/per-instance/elasticsearch.sh
+          content: |
+            #!/bin/bash
+            set -x
+            echo "Running boot script"
+            echo "Script started" > /var/log/userdata.log
+            curl -sfL --output /usr/share/keyrings/elastic-gpg-key https://artifacts.elastic.co/GPG-KEY-elasticsearch
+            sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys D27D666CD88E42B4
+            echo "deb [signed-by=/usr/share/keyrings/elastic-gpg-key] https://artifacts.elastic.co/packages/7.x/apt stable main" | sudo tee -a /etc/apt/sources.list.d/elastic-7.x.list
+            apt-get update
+            while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 ; do
+                sleep 1
+            done
+            sudo apt-get update && sudo apt-get install elasticsearch -y
+            sleep 10
+
+            # Configure Elasticsearch
+            elastic_ip=$(ip -o -4 addr show ens3 | awk '{split($4, a, "/"); print a[1]}')
+            if ! grep -q "network.host: $elastic_ip" /etc/elasticsearch/elasticsearch.yml; then
+                sudo tee -a /etc/elasticsearch/elasticsearch.yml <<EOF
+            network.host: $elastic_ip
+            EOF
+            fi
+            if ! grep -q "discovery.seed_hosts: \[\"$elastic_ip\"\]" /etc/elasticsearch/elasticsearch.yml; then
+                sudo tee -a /etc/elasticsearch/elasticsearch.yml <<EOF
+            discovery.seed_hosts: ["$elastic_ip"]
+            EOF
+            fi
+            if ! grep -q "cluster.initial_master_nodes: \[\"$elastic_ip\"\]" /etc/elasticsearch/elasticsearch.yml; then
+                sudo tee -a /etc/elasticsearch/elasticsearch.yml <<EOF
+            cluster.initial_master_nodes: ["$elastic_ip"]
+            EOF
+            fi
+            if ! grep -q "xpack.security.enabled: true" /etc/elasticsearch/elasticsearch.yml; then
+                sudo tee -a /etc/elasticsearch/elasticsearch.yml <<EOF
+            xpack.security.enabled: true
+            EOF
+            fi
+            if ! grep -q "xpack.security.transport.ssl.enabled: true" /etc/elasticsearch/elasticsearch.yml; then
+                sudo tee -a /etc/elasticsearch/elasticsearch.yml <<EOF
+            xpack.security.transport.ssl.enabled: true
+            EOF
+            fi
+
+            sudo systemctl daemon-reload
+            sudo systemctl enable elasticsearch
+            sudo systemctl start elasticsearch
+
+            # Set up passwords for built-in users
+            password_output=$(/usr/share/elasticsearch/bin/elasticsearch-setup-passwords auto -b)
+            cd /var/lib/cloud/scripts/per-instance/
+            mkdir password && cd password
+            echo "$password_output" >> /var/lib/cloud/scripts/per-instance/password/passwords.txt
+            password_output=$(cat /var/lib/cloud/scripts/per-instance/password/passwords.txt)
+            bootstrap_password=$(echo "$password_output" | grep 'PASSWORD elastic' | awk '{print $NF}')
+            echo $bootstrap_password
+
+            # Wait until Elasticsearch is up and running
+            URL="http://$elastic_ip:9200/_cat/health"
+            MAX_ATTEMPTS=30
+            SLEEP_INTERVAL=10
+            ATTEMPT=0
+
+            until [ $ATTEMPT -ge $MAX_ATTEMPTS ]; do
+              if curl -u elastic:$bootstrap_password -s $URL | grep -q "green" > /dev/null; then
+                echo "URL is reachable."
+                # Signal success to the wait condition
+                exit 0
+              else
+                echo "URL is not reachable yet. Waiting..."
+                sleep $SLEEP_INTERVAL
+                ATTEMPT=$((ATTEMPT + 1))
+              fi
+            done
+            echo "URL is not reachable within the timeout."
+            exit 1
+
+          permissions: 0755
+        runcmd:
+          - [ sh, -c, "/var/lib/cloud/scripts/per-instance/elasticsearch.sh" ]
+          - list_join: [ ' ', [ { get_attr: [ wait_handle_url_check, curl_cli ] }, --data-binary, '"{\"status\": \"SUCCESS\"}"' ] ]
+
+
+  root_volume_elasticsearch:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - elasticsearch
+      size: { get_param: elasticsearch_volume_size }
+      volume_type: ssd
+      image: ubuntu-focal-20-x86_64
+
+  # Backup resource for Elasticsearch
+  volume_backup_elasticsearch:
+    type: OS::Mistral::CronTrigger
+    condition: backup_elasticsearch
+    properties:
+      name:
+        str_replace:
+          template: elasticsearch-backup-${name}
+          params:
+            name: { get_attr: cron_name, default: default }
+      pattern: "0 0 * * *"
+      workflow:
+        name: 370a2bfd-4013-457b-b214-d06a510ce74c
+        input:
+          volume_id:
+            get_resource: root_volume_elasticsearch
+          incremental: false
+          force: true
+          container: volumebackups
+          delete_backups_whose_age_more_than_or_equal_days:
+            get_param: backup_days
+
+  # Logstash
+  port_logstash:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+        - 'bin-logstash'
+        - 'bin-ssh'
+  
+  logstashserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - logstash
+      flavor: { get_param: logstash_flavor }
+      networks:
+        - port: { get_resource: port_logstash }
+      key_name: { get_param: key }
+      block_device_mapping:
+        - device_name: vda
+          delete_on_termination: true
+          volume_id: { get_resource: root_volume_logstash }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: logstash_userdata }
+
+  logstash_userdata:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        packages:
+          - openjdk-11-jre-headless
+          - wget
+          - curl
+          - software-properties-common
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        write_files:
+          - path: /etc/logstash/conf.d/logstash.conf
+            content: |
+              input {
+                file {
+                  path => "/var/log/*"
+                  start_position => "beginning"
+                }
+              }
+
+              filter {
+                # Add any filters needed for your specific logs
+                # For example, if logs are in JSON format, you can use the json filter.
+                json {
+                  source => "message"
+                }
+              }
+
+              output {
+                elasticsearch {
+                  hosts => ["$elasticsearch_ip:9200"]
+                  index => "%{[@metadata][index]}"
+                }
+              }
+
+              # Add any additional Logstash configurations here
+
+        runcmd:
+          - curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elastic-keyring.gpg
+          - apt-get update
+          - apt-get install -y apt-transport-https wget sudo
+          - echo "deb [signed-by=/usr/share/keyrings/elastic-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main" | tee /etc/apt/sources.list.d/elastic-8.x.list
+          - apt-get update
+          - apt-get install -y logstash
+          - systemctl enable logstash
+          - systemctl start logstash
+          - list_join: [ ' ', [ { get_attr: [ wait_handle_url_check, curl_cli ] }, --data-binary, '"{\"status\": \"SUCCESS\"}"' ] ]
+
+  root_volume_logstash:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - logstash
+      size: 20
+      volume_type: ssd
+      image: ubuntu-focal-20-x86_64
+
+  # Kibana
+  port_kibana:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+        - 'bin-ssh'
+        - 'bin-http-https'
+
+  kibanaserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - kibana
+      flavor: { get_param: kibana_flavor }
+      networks:
+        - port: { get_resource: port_kibana }
+      key_name: { get_param: key }
+      block_device_mapping:
+        - device_name: vda
+          delete_on_termination: true
+          volume_id: { get_resource: root_volume_kibana }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: kibana_userdata }
+
+  kibana_userdata:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        packages:
+          - openjdk-11-jre-headless
+          - wget
+          - curl
+          - software-properties-common
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        write_files:
+          - path: /var/lib/cloud/scripts/per-boot/kibana.sh
+            content: |
+              #!/bin/bash
+              set -x
+              echo "Running boot script"
+              curl -fsSL https://artifacts.elastic.co/GPG-KEY-elasticsearch | gpg --dearmor -o /usr/share/keyrings/elastic-keyring.gpg
+              apt-get update
+              apt-get install -y apt-transport-https wget sudo
+              echo "deb [signed-by=/usr/share/keyrings/elastic-keyring.gpg] https://artifacts.elastic.co/packages/7.x/apt stable main" | tee /etc/apt/sources.list.d/elastic-7.x.list
+              apt-get update
+              apt-get install -y kibana
+
+              kibana_ip=$(ip -o -4 addr show ens3 | awk '{split($4, a, "/"); print a[1]}')
+              kibana_conf="/etc/kibana/kibana.yml"
+
+              # Remove any existing occurrences of server.host
+              sed -i '/^server.host:/d' "$kibana_conf"
+
+              # Append server.host with the new IP address
+              echo "server.host: $kibana_ip" | sudo tee -a "$kibana_conf"
+              # Replace "#elasticsearch.username: "kibana_system"" with "elasticsearch.username: "kibana_system""
+              sed -i 's/^#elasticsearch.username:/elasticsearch.username:/' /etc/kibana/kibana.yml
+
+              systemctl enable kibana
+              systemctl start kibana
+            permissions: 0755
+        runcmd:
+          - [ sh, -c, "/var/lib/cloud/scripts/per-boot/kibana.sh"]
+          - list_join: [ ' ', [ { get_attr: [ wait_handle_url_check, curl_cli ] }, --data-binary, '"{\"status\": \"SUCCESS\"}"' ] ]
+
+  root_volume_kibana:
+      type: OS::Cinder::Volume
+      properties:
+        name:
+          list_join:
+            - _
+            - - get_param: OS::stack_name
+              - kibana
+        size: 20
+        volume_type: ssd
+        image: ubuntu-focal-20-x86_64
+
+outputs:
+  ElasticSearch_Node:
+    description: Elasticsearch Node IP
+    value:
+      get_attr:
+        - elasticsearchserver
+        - first_address
+
+  BootstrapPassword:
+    description: Passwords for ELK stack is present in Elasticsearch server
+    value: cat /var/lib/cloud/scripts/per-instance/password/passwords.txt
+
+  Kibana_Link:
+    description: Kibana link (Update the Kibana_system password in kibana server at /etc/kibana/kibana.yml)
+    value:
+      str_replace:
+        template: http://host:80
+        params:
+          host:
+            get_attr:
+              - kibanaserver
+              - first_address
