@@ -1,0 +1,99 @@
+heat_template_version: wallaby
+description: Kibana
+parameters:
+  key:
+    type: string
+    description: Key pair name
+    constraints:
+      - custom_constraint: nova.keypair
+  local_net:
+    type: string
+    description: The local network you want the server to be attached on
+    default: local
+    constraints:
+      - custom_constraint: neutron.network
+  flavor_kibana:
+    type: string
+    description: Flavor to be used for the instance
+    default: gp.2x4
+    constraints:
+      - custom_constraint: nova.flavor
+  availability_zone:
+    type: string
+    default: europe-se-1a
+    description: The Availability Zone to launch the instance. Available options are europe-se-1a and europe-se-1b
+resources:
+  port_kibana:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+        - 'bin-kibana' # Used existing security group for kibana server
+  kibana_userdata:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        packages:
+          - openjdk-11-jre-headless
+          - wget
+          - curl
+          - software-properties-common
+          - kibana
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        runcmd:
+          - sed -i "s/#server.host:\"localhost\"/server.host: \"0.0.0.0\"/" /etc/kibana/kibana.yml
+          - systemctl enable kibana
+          - systemctl start kibana
+  kibanaserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - kibana
+      flavor:
+        get_param: flavor_kibana
+      networks:
+        - port:
+            get_resource: port_kibana
+      key_name:
+        get_param: key
+      block_device_mapping:
+        - device_name: vda
+          delete_on_termination: true
+          volume_id:
+            get_resource: root_volume_kibana
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: kibana_userdata
+  root_volume_kibana:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - kibana
+      size: 20
+      volume_type: ssd
+      image: ubuntu-jammy-22-x86_64
+outputs:
+  Kibana_Link:
+    description: Kibana link
+    value:
+      str_replace:
+        template: http://host:5601
+        params:
+          host:
+            get_attr:
+              - kibanaserver
+              - first_address

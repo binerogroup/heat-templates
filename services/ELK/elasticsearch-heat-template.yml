@@ -1,0 +1,108 @@
+heat_template_version: wallaby
+description: |
+  OpenStack Heat template for deploying an Elasticsearch instance. This template
+  provisions an Elasticsearch server with associated resources, such as a Neutron
+  port, Nova server, Cinder volume, and a Security Group for elasticsearch ports.
+
+parameters:
+  key:
+    type: string
+    description: Name of the key pair for SSH access
+    constraints:
+      - custom_constraint: nova.keypair
+
+  local_net:
+    type: string
+    description: Name of the local network to attach the server
+    default: local
+    constraints:
+      - custom_constraint: neutron.network
+
+  flavor_elasticsearch:
+    type: string
+    description: Flavor to be used for the Elasticsearch instance
+    default: gp.8x16
+    constraints:
+      - custom_constraint: nova.flavor
+
+  availability_zone:
+    type: string
+    default: europe-se-1a
+    description: |
+      The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b.
+
+resources:
+  port_elasticsearch:
+    type: OS::Neutron::Port
+    properties:
+      name: { get_param: OS::stack_name }
+      network: { get_param: local_net }
+      security_groups: [ 'bin-elasticsearch' ]  # Use the specified Security Group for Elasticsearch
+
+  elasticsearch_userdata:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        packages:
+          - openjdk-11-jre-headless
+          - wget
+          - curl
+          - software-properties-common
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        runcmd:
+          - sudo curl -sfL --output /usr/share/keyrings/elastic-gpg-key https://artifacts.elastic.co/GPG-KEY-elasticsearch
+          - echo "deb https://artifacts.elastic.co/packages/7.x/apt stable main" | sudo tee -a /etc/apt/sources.list.d/elastic-7.x.list
+          - sudo apt-get update
+          - sudo apt-get install elasticsearch -y
+          - sudo systemctl enable elasticsearch
+          - sudo systemctl start elasticsearch
+          - sleep 30
+          - |
+            if sudo systemctl is-active --quiet elasticsearch; then
+              echo "Elasticsearch is up and running!"
+            else
+              echo "Elasticsearch failed to start. Check logs for more information."
+              exit 1  # Exit with an error if Elasticsearch is not running
+            fi
+
+  elasticsearchserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - elasticsearch
+      flavor: { get_param: flavor_elasticsearch }
+      networks:
+        - port: { get_resource: port_elasticsearch }
+      key_name: { get_param: key }
+      block_device_mapping:
+        - device_name: vda
+          delete_on_termination: true
+          volume_id: { get_resource: root_volume_elasticsearch }
+      user_data_format: SOFTWARE_CONFIG
+      user_data: { get_resource: elasticsearch_userdata }
+
+  root_volume_elasticsearch:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - elasticsearch
+      size: 20
+      volume_type: ssd
+      image: ubuntu-jammy-22-x86_64
+
+outputs:
+  ElasticSearch_Node:
+    description: IP address of the Elasticsearch Node
+    value: { get_attr: [elasticsearchserver, first_address] }
