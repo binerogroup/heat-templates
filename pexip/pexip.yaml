@@ -1,0 +1,181 @@
+description: 'Pexip Environment.
+
+  '
+heat_template_version: '2018-08-31'
+parameters:
+  REMOTE_IP:
+    default: 83.168.200.0/24
+    description: Remote IP prefix that should be allowed to administrate PexIP
+    type: string
+    label: Remote IP
+  Management_flavor:
+    default: gp.2x4
+    constraints:
+    - custom_constraint: nova.flavor
+    description: Flavor to be used for management node
+    type: string
+    label: Management node size
+  Conference_flavor:
+    default: gp.4x8
+    constraints:
+    - custom_constraint: nova.flavor
+    description: Flavor to be used for conference node
+    type: string
+    label: Conference node size
+resources:
+  secgroup_internode:
+    properties:
+      description: 'Security group rule to allow traffic on port 500 internal'
+      name: Inter-node communication
+      rules:
+      - direction: ingress
+        protocol: esp
+        remote_ip_prefix: 10.165.1.0/24
+      - direction: ingress
+        protocol: udp
+        port_range_max: 500
+        port_range_min: 500
+        remote_ip_prefix: 10.165.1.0/24
+    type: OS::Neutron::SecurityGroup 
+  secgroup_administration:
+    properties:
+      description: 'Security group rule to allow external traffic from specific ip to administrative ports'
+      name: Administration access
+      rules:
+      - direction: ingress
+        protocol: tcp
+        port_range_max: 22
+        port_range_min: 22
+        remote_ip_prefix: 
+          get_param: REMOTE_IP
+      - direction: ingress
+        protocol: tcp
+        port_range_max: 80
+        port_range_min: 80
+        remote_ip_prefix: 
+          get_param: REMOTE_IP
+      - direction: ingress
+        protocol: tcp
+        port_range_max: 443
+        port_range_min: 443
+        remote_ip_prefix: 
+          get_param: REMOTE_IP
+      - direction: ingress
+        protocol: tcp
+        port_range_max: 8443
+        port_range_min: 8443
+        remote_ip_prefix: 
+          get_param: REMOTE_IP
+    type: OS::Neutron::SecurityGroup 
+  secgroup_peripheral:
+    properties:
+      description: 'Security group rule to create allow external connections from internet to port:
+        (icmp, tcp55000-65535, udp123, tcp443)
+
+        '
+      name: Peripheral services
+      rules:
+      - direction: egress
+        protocol: tcp
+        port_range_min: 55000
+        port_range_max: 65535
+      - direction: egress
+        protocol: udp
+        port_range_min: 55000
+        port_range_max: 65535
+      - direction: egress
+        protocol: udp
+        port_range_min: 123
+        port_range_max: 123
+      - direction: egress
+        protocol: tcp
+        port_range_min: 443
+        port_range_max: 443
+    type: OS::Neutron::SecurityGroup 
+  heat_network:
+    type: OS::Neutron::Net
+    properties:
+      admin_state_up: true
+      name: pexip_network_01
+  heat_network_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network: { get_resource: heat_network }
+      cidr: "10.165.1.0/24"
+      dns_nameservers: ["8.8.8.8"]
+      gateway_ip: "10.165.1.1"
+      ip_version: 4
+  heat_router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info: { network: europe-se-1-1a-net0 }
+      name: pexip_router_01
+  heat_router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: heat_router }
+      subnet: { get_resource: heat_network_subnet }
+  heat_server_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: heat_network }
+      security_groups: [get_resource: secgroup_internode, get_resource: secgroup_administration, get_resource: secgroup_peripheral]
+      fixed_ips:
+        - subnet_id: { get_resource: heat_network_subnet }
+  conference_server_port:
+    type: OS::Neutron::Port
+    properties:
+      network: { get_resource: heat_network }
+      security_groups: [get_resource: secgroup_internode, get_resource: secgroup_administration, get_resource: secgroup_peripheral]
+      fixed_ips:
+        - subnet_id: { get_resource: heat_network_subnet }
+  management_server:
+    type: OS::Nova::Server
+    properties:
+      name: pexip_management_01
+      flavor: gp.4x8
+      networks:
+        - port: { get_resource: heat_server_port}
+      block_device_mapping:
+        - device_name: vda
+          volume_id: { get_resource: volume_management }
+          delete_on_termination: false
+  heat_server_public_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: europe-se-1-1a-net0
+  conference_server_public_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: europe-se-1-1a-net0
+  heat_server_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: heat_server_public_ip }
+      port_id: { get_resource: heat_server_port }
+  conference_server_ip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: conference_server_public_ip }
+      port_id: { get_resource: conference_server_port }
+  volume_management:
+    type: OS::Cinder::Volume
+    properties:
+      size: 99
+      image: ea8b9033-3fd2-4454-94ee-57556498d6dc
+  volume_conference:
+    type: OS::Cinder::Volume
+    properties:
+      size: 49
+      image: a512f81c-c311-486c-8146-baf57ae9b564
+  conference_server:
+    type: OS::Nova::Server
+    properties:
+      name: pexip_conference_01
+      flavor: gp.4x8
+      networks:
+        - port: { get_resource: conference_server_port}
+      block_device_mapping:
+        - device_name: vda
+          volume_id: { get_resource: volume_conference }
+          delete_on_termination: false
