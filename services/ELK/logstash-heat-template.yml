@@ -1,0 +1,118 @@
+heat_template_version: wallaby
+description: |
+  OpenStack Heat template for deploying a Logstash instance.
+  This template provisions a Logstash server with associated resources,
+  including a Neutron port, Nova server, Cinder volume, and utilizes existing 
+  Security Groups for Logstash ports.
+
+parameters:
+  key:
+    type: string
+    description: Key pair name
+    constraints:
+      - custom_constraint: nova.keypair
+
+  local_net:
+    type: string
+    description: The local network we want the server to be attached to
+    default: local
+    constraints:
+      - custom_constraint: neutron.network
+
+  flavor_logstash:
+    type: string
+    description: Flavor to be used for the instance
+    default: gp.4x8
+    constraints:
+      - custom_constraint: nova.flavor
+
+  availability_zone:
+    type: string
+    default: europe-se-1a
+    description: |
+      The Availability Zone to launch the instance. Available options are
+      europe-se-1a and europe-se-1b.
+
+  influx_db:
+    type: boolean
+    default: false
+    description: Set up InfluxDB on the instance
+
+resources:
+  port_logstash:
+    type: OS::Neutron::Port
+    properties:
+      name:
+        get_param: OS::stack_name
+      network:
+        get_param: local_net
+      security_groups:
+        - 'bin-logstash'  # Use existing Security Group for Logstash
+
+  logstash_userdata:
+    type: OS::Heat::CloudConfig
+    properties:
+      cloud_config:
+        package_update: true
+        package_upgrade: true
+        packages:
+          - openjdk-11-jre-headless
+          - wget
+          - curl
+          - software-properties-common
+          - logstash
+        package_reboot_if_required: true
+        ssh_pwauth: false
+        chpasswd:
+          expire: false
+        runcmd:
+          - systemctl enable logstash
+          - systemctl start logstash
+
+  logstashserver:
+    type: OS::Nova::Server
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - logstash
+      flavor:
+        get_param: flavor_logstash
+      networks:
+        - port:
+            get_resource: port_logstash
+      key_name:
+        get_param: key
+      block_device_mapping:
+        - device_name: vda
+          delete_on_termination: true
+          volume_id:
+            get_resource: root_volume_logstash
+      user_data_format: SOFTWARE_CONFIG
+      user_data:
+        get_resource: logstash_userdata
+
+  root_volume_logstash:
+    type: OS::Cinder::Volume
+    properties:
+      name:
+        list_join:
+          - _
+          - - get_param: OS::stack_name
+            - logstash
+      size: 20
+      volume_type: ssd
+      image: ubuntu-jammy-22-x86_64
+
+outputs:
+  WebGui_local:
+    description: Logstash link
+    value:
+      str_replace:
+        template: http://host:5601
+        params:
+          host:
+            get_attr:
+              - logstashserver
+              - first_address
