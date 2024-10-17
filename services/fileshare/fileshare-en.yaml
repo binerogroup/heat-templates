@@ -25,7 +25,7 @@ parameters:
     label: Local network
     type: string
     description: The local network you want the server to be attached on (If you see
-      nothing you need to first create a local netowrok)
+      nothing you need to first create a local network)
     default: local
     constraints:
     - custom_constraint: neutron.network
