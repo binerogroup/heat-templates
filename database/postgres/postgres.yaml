@@ -387,7 +387,18 @@ resources:
               partition: 1
             mounts: [ [ LABEL=backupvol, /mnt/backup, ext4, 'defaults,noatime' ] ]
           - { }
+  primary_volume:
+     type: OS::Cinder::Volume
+     properties:
+       image: ubuntu-jammy-22-x86_64
+       availability_zone: { get_param: pri_az }
+       size:
+         yaql:
+           expression: int(max(6 + $.data.size, 20))
+           data:
+             size: { get_param: data_size }
   primary_instance:
+    depends_on: primary_volume
     type: OS::Nova::Server
     properties:
       name:
@@ -403,12 +414,7 @@ resources:
         list_concat:
         - - boot_index: 0
             delete_on_termination: false
-            image: ubuntu-jammy-22-x86_64
-            volume_size:
-              yaql:
-                expression: int(max(6 + $.data.size, 20))
-                data:
-                  size: { get_param: data_size }
+            volume_id: { get_resource: primary_volume }
             disk_bus: virtio
         - if:
           - do_backup
@@ -426,7 +432,7 @@ resources:
     type: OS::Heat::WaitCondition
     properties:
       handle: { get_resource: wait_handle }
-      timeout: 600
+      timeout: 1200
   wait_handle:
     type: OS::Heat::WaitConditionHandle
   primary_site_replica_nodes:
